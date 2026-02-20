@@ -1,0 +1,6 @@
+numpy>=1.19.0
+matplotlib>=3.3.0
+pyads>=3.5.0
+pyinstaller>=6.0.0
+
+
