@@ -333,73 +333,17 @@ class BeckhoffADSInterface:
             return True
             
         except pyads.ADSError as e:
-            # ADS-specific errors
+            # ADS-specific errors - pass through original error message
             error_code = getattr(e, 'ads_err_code', None)
             error_msg = str(e)
             
-            # Common ADS error codes and their meanings
-            error_descriptions = {
-                1: "Internal error",
-                2: "No Rtime",
-                3: "Allocation locked memory error",
-                4: "Insert mailbox error",
-                5: "Wrong receive HMSG",
-                6: "Target port not found",
-                7: "Target machine not found",
-                8: "Unknown command ID",
-                9: "Bad task ID",
-                10: "No IO",
-                11: "Unknown AMS command",
-                12: "Win 32 error",
-                13: "Port not connected",
-                14: "Invalid AMS length",
-                15: "Invalid AMS Net ID",
-                16: "Low installation level",
-                17: "No debug available",
-                18: "Port disabled",
-                19: "Port already connected",
-                20: "AMS Sync Win32 error",
-                21: "AMS Sync Timeout",
-                22: "AMS Sync AMS error",
-                23: "AMS Sync no index map",
-                24: "Invalid AMS port",
-                25: "No memory",
-                26: "TCP send error",
-                27: "Host unreachable",
-                1808: "Symbol not found",
-                1809: "Symbol version invalid",
-                1810: "Invalid symbol",
-                1811: "Symbol not found (no index)",
-                1812: "Invalid symbol name",
-                1813: "Symbol already exists",
-                1814: "Symbol changed",
-                1815: "Symbol deleted",
-                1816: "Symbol list empty",
-                1817: "Symbol size invalid",
-                1818: "Symbol already exists",
-                1819: "Symbol list full",
-                1820: "Invalid symbol index",
-            }
-            
-            description = error_descriptions.get(error_code, "Unknown ADS error")
-            detailed_msg = f"ADS Connection failed: {description} (Error code: {error_code})"
-            if error_code == 6:
-                detailed_msg += f"\nTarget port not found. Check if TwinCAT Runtime is running and port {port_display} is correct."
-            elif error_code == 7:
-                detailed_msg += f"\nTarget machine not found. Check AMS NetID '{self.ams_netid}' and network connectivity."
-            elif error_code == 13:
-                detailed_msg += f"\nPort not connected. Check if TwinCAT Runtime is running."
-            elif error_code == 15:
-                detailed_msg += f"\nInvalid AMS NetID '{self.ams_netid}'. Format should be: X.X.X.X.X.X (e.g., 127.0.0.1.1.1)"
-            elif error_code == 19:
-                detailed_msg += f"\nPort already connected. Attempting to close existing connection and retry..."
-                # Try to close and reconnect
+            # Handle port already connected (code 19) - try to reconnect
+            if error_code == 19:
                 try:
                     if self.plc:
                         self.plc.close()
                     self.plc = None
-                    # Retry connection
-                    time.sleep(0.1)  # Brief delay
+                    time.sleep(0.1)
                     self.plc = pyads.Connection(self.ams_netid, port)
                     self.plc.open()
                     msg = f"Reconnected to PLC at {self.ams_netid}:{port_display} after closing existing connection"
@@ -408,42 +352,28 @@ class BeckhoffADSInterface:
                         self.log_callback("connection", msg, {"ams_netid": self.ams_netid, "port": port})
                     return True
                 except Exception as retry_e:
-                    detailed_msg += f"\nRetry failed: {retry_e}"
-            elif error_code == 27:
-                detailed_msg += f"\nHost unreachable. Check network connectivity to '{self.ams_netid}'."
+                    error_msg = f"{error_msg} (Retry failed: {retry_e})"
             
-            print(f"[ADS Interface] {detailed_msg}")
-            print(f"[ADS Interface] Original error: {error_msg}")
+            print(f"[ADS Interface] Connection failed: {error_msg}")
             if self.log_callback:
-                self.log_callback("error", detailed_msg, {
+                self.log_callback("error", error_msg, {
                     "error": error_msg,
                     "error_code": error_code,
-                    "error_description": description,
                     "ams_netid": self.ams_netid,
                     "port": port,
                     "type": "ads_connection_error"
                 })
             self.plc = None
-            self._last_connection_error = detailed_msg
+            self._last_connection_error = error_msg
             return False
             
         except Exception as e:
             error_type = type(e).__name__
             error_msg = str(e)
-            detailed_msg = f"Connection failed: {error_type}: {error_msg}"
             
-            # Check for common issues
-            if "TcAdsDll.dll" in error_msg or "DLL" in error_msg:
-                detailed_msg += "\nTwinCAT Runtime DLL not found. Ensure TwinCAT Runtime is installed."
-            elif "timeout" in error_msg.lower():
-                detailed_msg += f"\nConnection timeout. Check network connectivity to '{self.ams_netid}'."
-            elif "permission" in error_msg.lower() or "access" in error_msg.lower():
-                detailed_msg += "\nPermission denied. Check if you have sufficient privileges to access TwinCAT."
-            elif "failed to open port" in error_msg.lower() or "open port" in error_msg.lower() or "port.*lock" in error_msg.lower() or "locked" in error_msg.lower():
-                detailed_msg += f"\nPort may be locked or already in use. Attempting to close existing connection and retry..."
-                # Try to close any existing connection and retry
+            # Handle port locked errors - try to reconnect
+            if "failed to open port" in error_msg.lower() or "open port" in error_msg.lower() or "port.*lock" in error_msg.lower() or "locked" in error_msg.lower():
                 try:
-                    # Force disconnect any existing connection
                     if self.plc:
                         try:
                             if hasattr(self.plc, 'is_open') and self.plc.is_open:
@@ -451,9 +381,7 @@ class BeckhoffADSInterface:
                         except:
                             pass
                     self.plc = None
-                    # Longer delay to ensure port is fully released by OS
                     time.sleep(0.5)
-                    # Retry connection
                     port = self.port if self.port is not None else pyads.PORT_TC3PLC1
                     port_display = port if self.port is not None else f"{port} (default)"
                     self.plc = pyads.Connection(self.ams_netid, port)
@@ -464,17 +392,11 @@ class BeckhoffADSInterface:
                         self.log_callback("connection", msg, {"ams_netid": self.ams_netid, "port": port})
                     return True
                 except Exception as retry_e:
-                    detailed_msg += f"\nRetry failed: {retry_e}"
-                    detailed_msg += "\nPossible causes:"
-                    detailed_msg += "\n- Another application/instance is using the ADS port"
-                    detailed_msg += "\n- Previous connection was not properly closed"
-                    detailed_msg += "\n- TwinCAT Runtime is not running"
-                    detailed_msg += "\n- Port is locked by another process"
-                    detailed_msg += f"\n\nTry: Close all instances of this application and wait a few seconds before retrying."
+                    error_msg = f"{error_msg} (Retry failed: {retry_e})"
             
-            print(f"[ADS Interface] {detailed_msg}")
+            print(f"[ADS Interface] Connection failed: {error_type}: {error_msg}")
             if self.log_callback:
-                self.log_callback("error", detailed_msg, {
+                self.log_callback("error", f"{error_type}: {error_msg}", {
                     "error": error_msg,
                     "error_type": error_type,
                     "ams_netid": self.ams_netid,
@@ -482,7 +404,7 @@ class BeckhoffADSInterface:
                     "type": "connection_error"
                 })
             self.plc = None
-            self._last_connection_error = detailed_msg
+            self._last_connection_error = f"{error_type}: {error_msg}"
             return False
     
     def disconnect(self):
@@ -543,44 +465,34 @@ class BeckhoffADSInterface:
                 self.log_callback("connection", f"Initial trigger state read: {self.var_trigger} = {current_trigger}", 
                                 {"variable": self.var_trigger, "value": current_trigger})
         except pyads.ADSError as e:
-            # ADS-specific error reading trigger
+            # ADS-specific error reading trigger - pass through original error
             error_code = getattr(e, 'ads_err_code', None)
             error_msg = str(e)
             
-            if error_code == 1808:
-                detailed_msg = f"Trigger variable '{self.var_trigger}' not found in PLC.\nCheck variable name in ADS settings."
-            elif error_code == 7:
-                detailed_msg = f"Target machine not found. Check AMS NetID '{self.ams_netid}'."
-            elif error_code == 13:
-                detailed_msg = "Port not connected. Connection may have been lost."
-            else:
-                detailed_msg = f"Could not read initial trigger state: {error_msg} (Error code: {error_code})"
-            
             self.last_trigger_state = False
             if self.log_callback:
-                self.log_callback("error", detailed_msg, {
+                self.log_callback("error", f"Could not read initial trigger state: {error_msg}", {
                     "error": error_msg,
                     "error_code": error_code,
                     "variable": self.var_trigger,
                     "type": "read_error"
                 })
-            self._last_polling_error = detailed_msg
+            self._last_polling_error = f"Could not read initial trigger state: {error_msg}"
             
         except Exception as e:
-            # Other errors reading trigger state
+            # Other errors reading trigger state - pass through original error
             error_type = type(e).__name__
             error_msg = str(e)
-            detailed_msg = f"Could not read initial trigger state: {error_type}: {error_msg}"
             
             self.last_trigger_state = False
             if self.log_callback:
-                self.log_callback("error", detailed_msg, {
+                self.log_callback("error", f"Could not read initial trigger state: {error_type}: {error_msg}", {
                     "error": error_msg,
                     "error_type": error_type,
                     "variable": self.var_trigger,
                     "type": "read_error"
                 })
-            self._last_polling_error = detailed_msg
+            self._last_polling_error = f"Could not read initial trigger state: {error_type}: {error_msg}"
         
         self.running = True
         self.poll_thread = threading.Thread(
@@ -717,65 +629,48 @@ class BeckhoffADSInterface:
                     # This preserves the state until measurement completes, allowing proper edge detection
                     
                 except pyads.ADSError as e:
-                    # ADS-specific error (variable not found, etc.)
+                    # ADS-specific error - pass through original error
                     error_code = getattr(e, 'ads_err_code', None)
                     error_msg = str(e)
                     
                     # Check if connection is still open
                     connection_status = "open" if (self.plc and self.plc.is_open) else "closed"
                     
-                    if error_code == 1808:  # Symbol not found
-                        msg = f"Variable not found: {self.var_trigger}. Make sure variable exists in PLC. (Connection: {connection_status})"
-                        print(f"[ADS Interface] {msg}")
+                    print(f"[ADS Interface] ADS error reading variables: {error_msg}")
+                    if self.log_callback:
+                        self.log_callback("error", f"ADS error reading variables: {error_msg}", {
+                            "error": error_msg,
+                            "ads_err_code": error_code,
+                            "connection_status": connection_status,
+                            "type": "ads_error"
+                        })
+                    
+                    # If connection is closed, try to reconnect
+                    if connection_status == "closed":
                         if self.log_callback:
-                            self.log_callback("error", msg, {
-                                "error": error_msg,
-                                "ads_err_code": error_code,
-                                "variable": self.var_trigger,
-                                "connection_status": connection_status,
-                                "type": "symbol_not_found"
-                            })
-                    else:
-                        if error_code is not None:
-                            msg = f"ADS error reading variables: {error_msg} (Error code: {error_code}, Connection: {connection_status})"
-                        else:
-                            msg = f"ADS error reading variables: {error_msg} (Connection: {connection_status})"
-                        print(f"[ADS Interface] {msg}")
-                        if self.log_callback:
-                            self.log_callback("error", msg, {
-                                "error": error_msg,
-                                "ads_err_code": error_code,
-                                "connection_status": connection_status,
-                                "type": "ads_error"
-                            })
-                        
-                        # If connection is closed, try to reconnect
-                        if connection_status == "closed":
-                            if self.log_callback:
-                                self.log_callback("connection", "Connection lost, attempting to reconnect...", {})
-                            try:
-                                if self.connect():
-                                    if self.log_callback:
-                                        self.log_callback("connection", "Reconnected successfully", {})
-                                else:
-                                    if self.log_callback:
-                                        self.log_callback("error", "Reconnection failed", {})
-                            except Exception as reconnect_e:
+                            self.log_callback("connection", "Connection lost, attempting to reconnect...", {})
+                        try:
+                            if self.connect():
                                 if self.log_callback:
-                                    self.log_callback("error", f"Reconnection error: {reconnect_e}", {})
+                                    self.log_callback("connection", "Reconnected successfully", {})
+                            else:
+                                if self.log_callback:
+                                    self.log_callback("error", "Reconnection failed", {})
+                        except Exception as reconnect_e:
+                            if self.log_callback:
+                                self.log_callback("error", f"Reconnection error: {reconnect_e}", {})
                     
                     time.sleep(interval)
                     continue
                 except Exception as e:
-                    # Other errors
+                    # Other errors - pass through original error
                     error_type = type(e).__name__
                     error_msg = str(e)
                     connection_status = "open" if (self.plc and self.plc.is_open) else "closed"
                     
-                    msg = f"Error reading PLC variables: {error_type}: {error_msg} (Connection: {connection_status})"
-                    print(f"[ADS Interface] {msg}")
+                    print(f"[ADS Interface] Error reading PLC variables: {error_type}: {error_msg}")
                     if self.log_callback:
-                        self.log_callback("error", msg, {
+                        self.log_callback("error", f"Error reading PLC variables: {error_type}: {error_msg}", {
                             "error": error_msg,
                             "error_type": error_type,
                             "connection_status": connection_status,

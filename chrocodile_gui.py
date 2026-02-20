@@ -11,6 +11,10 @@ import queue
 import time
 import numpy as np
 from typing import Optional
+import logging
+import os
+import sys
+from datetime import datetime
 
 from device_controller import CHRocodileController, ConnectionState
 from simulator import CHRocodileSimulator
@@ -63,6 +67,9 @@ class CHRocodileGUI:
         # Settings manager
         self.settings_manager = SettingsManager()
         
+        # Setup file logging
+        self._setup_file_logging()
+        
         # Beckhoff PLC interface (ADS only)
         self.beckhoff_ads_interface = None
         self.beckhoff_enabled = False
@@ -75,6 +82,9 @@ class CHRocodileGUI:
         
         # Setup GUI
         self._create_widgets()
+        
+        # Display log file location in status (after GUI is ready)
+        self._log_status(f"Logging to: {self.log_file_path}")
         
         # Start queue processing
         self.root.after(100, self._process_queue)
@@ -327,12 +337,68 @@ class CHRocodileGUI:
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
         self.status_text.configure(yscrollcommand=scrollbar.set)
         
+    def _setup_file_logging(self):
+        """Setup file logging for the application."""
+        # Determine log file path (next to executable or in project directory)
+        if getattr(sys, 'frozen', False):
+            # Running as compiled executable
+            log_dir = os.path.dirname(sys.executable)
+        else:
+            # Running as script
+            log_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Create log file with timestamp in name
+        log_filename = f"chrocodile_{datetime.now().strftime('%Y%m%d')}.log"
+        self.log_file_path = os.path.join(log_dir, log_filename)
+        
+        # Setup logging
+        self.logger = logging.getLogger('CHRocodile')
+        self.logger.setLevel(logging.DEBUG)
+        
+        # Remove existing handlers to avoid duplicates
+        self.logger.handlers.clear()
+        
+        # File handler with rotation (max 10MB, keep 5 backup files)
+        from logging.handlers import RotatingFileHandler
+        file_handler = RotatingFileHandler(
+            self.log_file_path,
+            maxBytes=10*1024*1024,  # 10MB
+            backupCount=5,
+            encoding='utf-8'
+        )
+        file_handler.setLevel(logging.DEBUG)
+        
+        # Format: timestamp, level, message
+        formatter = logging.Formatter(
+            '%(asctime)s [%(levelname)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(formatter)
+        
+        self.logger.addHandler(file_handler)
+        
+        # Log application start
+        self.logger.info("=" * 80)
+        self.logger.info("CHRocodile Application Started")
+        self.logger.info(f"Log file: {self.log_file_path}")
+        self.logger.info("=" * 80)
+    
     def _log_status(self, message: str):
-        """Add message to status text area."""
-        self.status_text.config(state=tk.NORMAL)
-        self.status_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
-        self.status_text.see(tk.END)
-        self.status_text.config(state=tk.DISABLED)
+        """Add message to status text area and log file."""
+        # Add to GUI status text (if GUI is initialized)
+        if hasattr(self, 'status_text') and self.status_text is not None:
+            try:
+                self.status_text.config(state=tk.NORMAL)
+                self.status_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
+                self.status_text.see(tk.END)
+                self.status_text.config(state=tk.DISABLED)
+            except (tk.TclError, AttributeError):
+                # GUI widget may not be ready yet or was destroyed
+                pass
+        
+        # Also log to file
+        if hasattr(self, 'logger'):
+            self.logger.info(message)
         
     def _process_queue(self):
         """Process data from queue (called periodically from main thread)."""
@@ -349,7 +415,10 @@ class CHRocodileGUI:
     def _handle_measurement_data(self, data: dict):
         """Handle measurement data in main thread."""
         if 'error' in data:
-            self._log_status(f"Error: {data['error']}")
+            error_msg = data['error']
+            self._log_status(f"Error: {error_msg}")
+            if hasattr(self, 'logger'):
+                self.logger.error(f"Measurement error: {error_msg}")
             return
         
         # Update display
@@ -383,6 +452,13 @@ class CHRocodileGUI:
         # Update count
         self.measurement_count += 1
         self.count_label.config(text=str(self.measurement_count))
+        
+        # Log measurement to file
+        if hasattr(self, 'logger'):
+            thickness = data.get('thickness')
+            peak1 = data.get('peak1')
+            peak2 = data.get('peak2')
+            self.logger.info(f"Measurement #{self.measurement_count}: Thickness={thickness:.3f} μm, Peak1={peak1:.1f}, Peak2={peak2:.1f}")
         
         # Send measurement result to Beckhoff PLC via ADS if interface is active
         # This ensures PLC-triggered measurements complete the handshake properly
@@ -443,11 +519,17 @@ class CHRocodileGUI:
             self.apply_settings_btn.config(state=tk.NORMAL)
             self.view_config_btn.config(state=tk.NORMAL)
             self._log_status(f"Connected: {message}")
+            if hasattr(self, 'logger'):
+                ip_address = self.ip_entry.get().strip()
+                self.logger.info(f"Device connected: IP={ip_address}, Message={message}")
         else:
             self.status_label.config(text="Connection Failed", foreground="red")
             self.connect_btn.config(state=tk.NORMAL)
             messagebox.showerror("Connection Error", message)
             self._log_status(f"Connection failed: {message}")
+            if hasattr(self, 'logger'):
+                ip_address = self.ip_entry.get().strip()
+                self.logger.error(f"Device connection failed: IP={ip_address}, Error={message}")
     
     def on_disconnect(self):
         """Handle disconnect button click."""
@@ -466,8 +548,12 @@ class CHRocodileGUI:
             self.apply_settings_btn.config(state=tk.DISABLED)
             self.view_config_btn.config(state=tk.DISABLED)
             self._log_status("Disconnected")
+            if hasattr(self, 'logger'):
+                self.logger.info("Device disconnected")
         else:
             messagebox.showerror("Error", message)
+            if hasattr(self, 'logger'):
+                self.logger.error(f"Disconnect error: {message}")
     
     def on_configure_device_ip(self):
         """Handle configure device IP button click."""
@@ -573,6 +659,8 @@ class CHRocodileGUI:
         
         if self.simulation_mode:
             self._log_status("Simulation mode enabled")
+            if hasattr(self, 'logger'):
+                self.logger.info("Simulation mode enabled")
             # Enable controls even without connection
             self.single_measure_btn.config(state=tk.NORMAL)
             self.continuous_btn.config(state=tk.NORMAL)
@@ -583,6 +671,8 @@ class CHRocodileGUI:
             self.view_config_btn.config(state=tk.DISABLED)
         else:
             self._log_status("Simulation mode disabled")
+            if hasattr(self, 'logger'):
+                self.logger.info("Simulation mode disabled")
             # Disable controls if not connected
             if not self.controller.is_connected():
                 self.single_measure_btn.config(state=tk.DISABLED)
@@ -1198,24 +1288,60 @@ class CHRocodileGUI:
             # Get variable names from settings
             variables = ads_settings.get('variables', {})
             
-            # Initialize ADS interface with log callback for monitor
-            log_callback = None
-            if self.beckhoff_monitor_window:
-                log_callback = self.beckhoff_monitor_window.log_event
+            # Create combined log callback (monitor + file logging)
+            # Store as instance variable so it can be reused when monitor window opens/closes
+            def create_combined_log_callback():
+                def combined_log_callback(event_type: str, message: str, data: dict = None):
+                    """Log callback that writes to both monitor and file."""
+                    # Write to monitor if open
+                    if self.beckhoff_monitor_window:
+                        try:
+                            if self.beckhoff_monitor_window.window.winfo_exists():
+                                self.beckhoff_monitor_window.log_event(event_type, message, data)
+                        except Exception:
+                            pass  # Monitor window might be closed
+                    
+                    # Write to log file
+                    if hasattr(self, 'logger'):
+                        # Format log message with event type
+                        log_level = {
+                            'error': logging.ERROR,
+                            'connection': logging.INFO,
+                            'read': logging.DEBUG,
+                            'write': logging.DEBUG,
+                            'trigger': logging.INFO,
+                            'handshake': logging.INFO,
+                        }.get(event_type.lower(), logging.INFO)
+                        
+                        log_message = f"[ADS {event_type.upper()}] {message}"
+                        if data:
+                            # Add relevant data to log message
+                            relevant_data = {k: v for k, v in data.items() 
+                                           if k not in ['type'] and v is not None}
+                            if relevant_data:
+                                log_message += f" | Data: {relevant_data}"
+                        
+                        self.logger.log(log_level, log_message)
+                return combined_log_callback
+            
+            # Store the callback creator function
+            self._create_combined_log_callback = create_combined_log_callback
+            combined_log_callback = create_combined_log_callback()
             
             self.beckhoff_ads_interface = BeckhoffADSInterface(
                 ams_netid=ams_netid,
                 port=port if port is not None else (pyads.PORT_TC3PLC1 if pyads else None),
                 callback=self._beckhoff_command_callback,
                 symbol_prefix=symbol_prefix,
-                log_callback=log_callback,
+                log_callback=combined_log_callback,
                 write_timeout=write_timeout
             )
             
             # Update monitor window if it exists
             if self.beckhoff_monitor_window:
                 self.beckhoff_monitor_window.ads_interface = self.beckhoff_ads_interface
-                self.beckhoff_ads_interface.log_callback = self.beckhoff_monitor_window.log_event
+                # Update callback to use combined callback
+                self.beckhoff_ads_interface.log_callback = combined_log_callback
             
             # Override variable names if custom ones are provided
             if variables:
@@ -1250,10 +1376,18 @@ class CHRocodileGUI:
             if self.beckhoff_enabled:
                 if self.beckhoff_ads_interface.start_polling(poll_interval=poll_interval):
                     self._log_status(f"Beckhoff ADS interface started (AMS: {self.beckhoff_ams_netid})")
+                    if hasattr(self, 'logger'):
+                        port_display = port if port is not None else (pyads.PORT_TC3PLC1 if pyads else None)
+                        self.logger.info(f"Beckhoff ADS interface started: AMS={ams_netid}, Port={port_display}, PollInterval={poll_interval}s")
                 else:
                     self._log_status("Failed to start Beckhoff ADS interface")
+                    if hasattr(self, 'logger'):
+                        last_error = self.beckhoff_ads_interface.get_last_error() if self.beckhoff_ads_interface else None
+                        self.logger.error(f"Failed to start Beckhoff ADS interface: {last_error}")
         except Exception as e:
             self._log_status(f"Error initializing Beckhoff ADS interface: {e}")
+            if hasattr(self, 'logger'):
+                self.logger.error(f"Error initializing Beckhoff ADS interface: {e}", exc_info=True)
     
     def _beckhoff_command_callback(self, command: str, **kwargs) -> dict:
         """
@@ -1336,6 +1470,8 @@ class CHRocodileGUI:
                 if self.beckhoff_ads_interface.start_polling(poll_interval=poll_interval):
                     self._log_status(f"Beckhoff ADS interface enabled (AMS: {self.beckhoff_ams_netid})")
                     self.beckhoff_status_label.config(text=f"Status: On ({self.beckhoff_ams_netid})", foreground="green")
+                    if hasattr(self, 'logger'):
+                        self.logger.info(f"Beckhoff ADS interface enabled: AMS={self.beckhoff_ams_netid}")
                 else:
                     self.beckhoff_enabled = False
                     if hasattr(self, 'beckhoff_check'):
@@ -1346,19 +1482,16 @@ class CHRocodileGUI:
                     last_error = self.beckhoff_ads_interface.get_last_error() if self.beckhoff_ads_interface else None
                     if last_error:
                         error_msg += f": {last_error}"
-                        # Show detailed error in messagebox
+                        # Show error in messagebox
                         messagebox.showerror(
                             "ADS Interface Error",
-                            f"Failed to start Beckhoff ADS interface.\n\n{last_error}\n\n"
-                            "Please check:\n"
-                            "- TwinCAT Runtime is installed and running\n"
-                            "- AMS NetID is correct\n"
-                            "- Network connectivity to PLC\n"
-                            "- ADS port is correct (default: 851)"
+                            f"Failed to start Beckhoff ADS interface.\n\n{last_error}"
                         )
                     
                     self._log_status(error_msg)
                     self.beckhoff_status_label.config(text="Status: Error - See log", foreground="red")
+                    if hasattr(self, 'logger'):
+                        self.logger.error(f"Failed to start Beckhoff ADS interface: {last_error}")
             elif self.beckhoff_ads_interface and self.beckhoff_ads_interface.is_running():
                 self.beckhoff_status_label.config(text=f"Status: On ({self.beckhoff_ams_netid})", foreground="green")
         else:
@@ -1366,6 +1499,8 @@ class CHRocodileGUI:
             if self.beckhoff_ads_interface:
                 self.beckhoff_ads_interface.stop_polling()
                 self._log_status("Beckhoff ADS interface disabled")
+                if hasattr(self, 'logger'):
+                    self.logger.info("Beckhoff ADS interface disabled")
             self.beckhoff_status_label.config(text="Status: Off", foreground="gray")
     
     def on_beckhoff_settings(self):
@@ -1607,9 +1742,13 @@ class CHRocodileGUI:
         # Create or show monitor window
         if self.beckhoff_monitor_window is None or not self.beckhoff_monitor_window.window.winfo_exists():
             self.beckhoff_monitor_window = BeckhoffADSMonitor(self.root, self.beckhoff_ads_interface, self)
-            # Update ADS interface with log callback
+            # Update ADS interface with combined log callback (monitor + file)
             if self.beckhoff_ads_interface:
-                self.beckhoff_ads_interface.log_callback = self.beckhoff_monitor_window.log_event
+                if hasattr(self, '_create_combined_log_callback'):
+                    self.beckhoff_ads_interface.log_callback = self._create_combined_log_callback()
+                else:
+                    # Fallback if callback creator doesn't exist yet
+                    self.beckhoff_ads_interface.log_callback = self.beckhoff_monitor_window.log_event
         else:
             # Bring existing window to front
             self.beckhoff_monitor_window.window.lift()
@@ -1870,6 +2009,10 @@ def main():
     
     # Cleanup on window close
     def on_closing():
+        if hasattr(app, 'logger'):
+            app.logger.info("=" * 80)
+            app.logger.info("CHRocodile Application Shutting Down")
+            app.logger.info("=" * 80)
         if app.beckhoff_ads_interface:
             app.beckhoff_ads_interface.stop_polling()
         app.controller.disconnect()
