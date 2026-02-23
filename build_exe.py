@@ -8,6 +8,23 @@ import os
 import sys
 import PyInstaller.__main__
 
+# Check if pyads is available before building
+print("=" * 60)
+print("Checking for required packages...")
+try:
+    import pyads
+    print(f"[OK] pyads found at: {pyads.__file__}")
+except ImportError:
+    print("[ERROR] pyads NOT FOUND!")
+    print("  Install with: pip install pyads")
+    print("  Without pyads, ADS features will be disabled in the EXE")
+    response = input("\nContinue building anyway? (y/n): ")
+    if response.lower() != 'y':
+        print("Build cancelled.")
+        sys.exit(1)
+print("=" * 60)
+print()
+
 def build_exe():
     """Build single-file executable."""
     
@@ -63,11 +80,22 @@ def build_exe():
     # Add pyads if available (but don't fail if not)
     try:
         import pyads
+        from PyInstaller.utils.hooks import collect_submodules
         args.extend([
             '--hidden-import', 'pyads',
         ])
-    except:
-        pass  # pyads not available, that's OK
+        # Collect all pyads submodules
+        try:
+            pyads_submodules = collect_submodules('pyads')
+            for submod in pyads_submodules:
+                args.extend(['--hidden-import', submod])
+            print(f"Including {len(pyads_submodules)} pyads submodules")
+        except:
+            pass
+    except ImportError:
+        print("Warning: pyads not available at build time - ADS features will be disabled in EXE")
+    except Exception as e:
+        print(f"Warning: Error checking for pyads: {e}")
     
     print("Building executable with PyInstaller...")
     print(f"Script: {main_script}")
@@ -81,7 +109,12 @@ def build_exe():
     spec_file = os.path.join(script_dir, 'CHRocodileGUI.spec')
     if os.path.exists(spec_file):
         print(f"Using spec file: {spec_file}")
-        PyInstaller.__main__.run([spec_file, '--clean'])
+        # Try with --clean first, but if it fails due to permissions, try without
+        try:
+            PyInstaller.__main__.run([spec_file, '--clean'])
+        except PermissionError:
+            print("Warning: Could not clean build directory (may be locked), building without clean...")
+            PyInstaller.__main__.run([spec_file])
     else:
         # Fallback to command-line args
         print("Spec file not found, using command-line arguments...")

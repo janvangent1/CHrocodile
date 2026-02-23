@@ -60,12 +60,36 @@ hiddenimports = [
     'settings_manager',
 ]
 
-# Try to add pyads if available
+# Add pyads and all its submodules if available
+# IMPORTANT: pyads must be installed in the Python environment used for building
 try:
     import pyads
     hiddenimports.append('pyads')
-except:
-    pass
+    print(f"[Build] Found pyads at: {pyads.__file__}")
+    
+    # Collect all pyads submodules to ensure they're included
+    try:
+        pyads_submodules = collect_submodules('pyads')
+        hiddenimports.extend(pyads_submodules)
+        print(f"[Build] Including pyads submodules: {len(pyads_submodules)} modules")
+    except Exception as e:
+        print(f"[Build] Warning: Could not collect pyads submodules: {e}")
+    
+    # Also collect pyads data files if any
+    try:
+        pyads_datas = collect_data_files('pyads')
+        if pyads_datas:
+            datas.extend(pyads_datas)
+            print(f"[Build] Including pyads data files: {len(pyads_datas)} files")
+    except Exception as e:
+        print(f"[Build] Warning: Could not collect pyads data files: {e}")
+        
+except ImportError:
+    print("[Build] ERROR: pyads not available at build time!")
+    print("[Build] Install pyads with: pip install pyads")
+    print("[Build] ADS features will be DISABLED in the EXE")
+except Exception as e:
+    print(f"[Build] Warning: Error checking for pyads: {e}")
 
 # Find CHRocodile DLL files
 # DLLs are included via the datas section (entire chrocodilelib directory)

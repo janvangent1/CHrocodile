@@ -4,6 +4,16 @@ CHRocodile Film Thickness Measurement GUI Application
 Main application window for controlling CHRocodile 2 LR device.
 """
 
+import os
+import sys
+
+# Fix TwinCAT DLL loading for frozen executable (no Python installed on target PC)
+# Must run BEFORE any import that loads pyads. Frozen .exe does not inherit DLL search paths.
+if getattr(sys, 'frozen', False):
+    _tc_path = r"C:\Program Files (x86)\Beckhoff\TwinCAT\Common64"
+    if os.path.exists(_tc_path):
+        os.add_dll_directory(_tc_path)
+
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
@@ -12,8 +22,6 @@ import time
 import numpy as np
 from typing import Optional
 import logging
-import os
-import sys
 from datetime import datetime
 
 from device_controller import CHRocodileController, ConnectionState
@@ -1991,16 +1999,26 @@ class BeckhoffADSMonitor:
     
     def on_close(self):
         """Handle window close."""
-        # Remove log callback from ADS interface to prevent errors after window is closed
-        if self.ads_interface:
-            self.ads_interface.log_callback = None
-        
-        # Clear reference in parent GUI if it exists
-        if self.gui_instance and hasattr(self.gui_instance, 'beckhoff_monitor_window'):
-            if self.gui_instance.beckhoff_monitor_window is self:
-                self.gui_instance.beckhoff_monitor_window = None
-        
-        self.window.destroy()
+        try:
+            # Remove log callback from ADS interface to prevent errors after window is closed
+            if self.ads_interface:
+                self.ads_interface.log_callback = None
+            
+            # Clear reference in parent GUI if it exists
+            if self.gui_instance and hasattr(self.gui_instance, 'beckhoff_monitor_window'):
+                if self.gui_instance.beckhoff_monitor_window is self:
+                    self.gui_instance.beckhoff_monitor_window = None
+            
+            # Destroy window
+            if self.window and self.window.winfo_exists():
+                self.window.destroy()
+        except Exception:
+            # If anything fails, just try to destroy the window
+            try:
+                if self.window:
+                    self.window.destroy()
+            except:
+                pass
 
 def main():
     """Main entry point."""
@@ -2009,14 +2027,41 @@ def main():
     
     # Cleanup on window close
     def on_closing():
-        if hasattr(app, 'logger'):
-            app.logger.info("=" * 80)
-            app.logger.info("CHRocodile Application Shutting Down")
-            app.logger.info("=" * 80)
-        if app.beckhoff_ads_interface:
-            app.beckhoff_ads_interface.stop_polling()
-        app.controller.disconnect()
-        root.destroy()
+        try:
+            if hasattr(app, 'logger'):
+                app.logger.info("=" * 80)
+                app.logger.info("CHRocodile Application Shutting Down")
+                app.logger.info("=" * 80)
+            
+            # Close monitor window first (before stopping ADS interface)
+            if hasattr(app, 'beckhoff_monitor_window') and app.beckhoff_monitor_window:
+                try:
+                    if app.beckhoff_monitor_window.window.winfo_exists():
+                        app.beckhoff_monitor_window.on_close()
+                except Exception:
+                    pass  # Window might already be closed
+            
+            # Stop ADS interface polling and disconnect
+            if app.beckhoff_ads_interface:
+                try:
+                    app.beckhoff_ads_interface.stop_polling()
+                except Exception:
+                    pass  # Might already be stopped
+            
+            # Disconnect device controller
+            try:
+                app.controller.disconnect()
+            except Exception:
+                pass  # Might already be disconnected
+            
+            # Destroy root window
+            root.destroy()
+        except Exception as e:
+            # Force destroy even if cleanup fails
+            try:
+                root.destroy()
+            except:
+                pass
     
     root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()
