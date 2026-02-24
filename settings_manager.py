@@ -19,8 +19,8 @@ class SettingsManager:
             "ams_netid": "127.0.0.1.1.1",
             "port": None,  # None = use default PORT_TC3PLC1
             "symbol_prefix": "GVL_CHRocodile.",
-            "poll_interval": 0.1,
-            "write_timeout": 1.0,  # Timeout for PLC write operations in seconds (default: 1.0s for slow networks)
+            "poll_interval": 0.05,  # 50 ms – faster trigger/results detection (was 0.1)
+            "write_timeout": 0.5,  # Timeout for PLC write operations (seconds); lower = quicker failure detection
             "variables": {
                 "trigger": "bTriggerMeasurement",
                 "start_continuous": "bStartContinuous",

@@ -10,25 +10,63 @@ import time
 import threading
 from typing import Callable, Optional, Dict, Any
 
-# Fix TwinCAT DLL loading for frozen executable (PyInstaller, etc.)
-# Must be BEFORE importing pyads. Frozen .exe does not inherit DLL search paths.
-if getattr(sys, 'frozen', False):
-    _tc_path = r"C:\Program Files (x86)\Beckhoff\TwinCAT\Common64"
-    if os.path.exists(_tc_path):
-        os.add_dll_directory(_tc_path)
+def _candidate_twincat_dll_dirs():
+    """Return likely TwinCAT Common64 locations, in preferred order."""
+    candidates = []
 
-# Try to import pyads - handle missing DLL gracefully
+    # Runtime/XAE installs often set TWINCAT3DIR; prefer that when present.
+    tc3dir = os.environ.get("TWINCAT3DIR")
+    if tc3dir:
+        candidates.append(os.path.normpath(os.path.join(tc3dir, "..", "Common64")))
+        candidates.append(os.path.normpath(os.path.join(tc3dir, "Common64")))
+
+    # Common installation locations (runtime and XAE variants).
+    candidates.extend([
+        r"C:\TwinCAT\Common64",
+        r"C:\TwinCAT\3.1\Common64",
+        r"C:\Program Files (x86)\Beckhoff\TwinCAT\Common64",
+    ])
+
+    # Keep order but remove duplicates.
+    unique = []
+    seen = set()
+    for path in candidates:
+        key = path.lower()
+        if key not in seen:
+            unique.append(path)
+            seen.add(key)
+    return unique
+
+
+# Try to import pyads; only add DLL directories as fallback if import fails.
 PYADS_AVAILABLE = False
+pyads = None
+_import_error = None
+
 try:
-    import pyads
-    _ = pyads.PORT_TC3PLC1  # Test if DLL is available
+    import pyads as _pyads_mod
+    _ = _pyads_mod.PORT_TC3PLC1
+    pyads = _pyads_mod
     PYADS_AVAILABLE = True
 except (ImportError, OSError, FileNotFoundError) as e:
-    PYADS_AVAILABLE = False
-    pyads = None
-    print(f"Warning: pyads not available: {e}")
+    _import_error = e
+
+if not PYADS_AVAILABLE and getattr(sys, "frozen", False):
+    for _tc_path in _candidate_twincat_dll_dirs():
+        try:
+            if os.path.exists(_tc_path):
+                os.add_dll_directory(_tc_path)
+                import pyads as _pyads_mod
+                _ = _pyads_mod.PORT_TC3PLC1
+                pyads = _pyads_mod
+                PYADS_AVAILABLE = True
+                break
+        except (ImportError, OSError, FileNotFoundError):
+            continue
+
+if not PYADS_AVAILABLE:
+    print(f"Warning: pyads not available: {_import_error}")
     print("Note: TwinCAT Runtime or XAE must be installed.")
-    print("DLL location: C:\\Program Files (x86)\\Beckhoff\\TwinCAT\\Common64")
 
 
 class BeckhoffADSInterface:
@@ -43,7 +81,7 @@ class BeckhoffADSInterface:
         callback: Optional[Callable] = None,
         symbol_prefix: str = 'GVL_CHRocodile.',
         log_callback: Optional[Callable] = None,
-        write_timeout: float = 1.0,
+        write_timeout: float = 0.5,
     ):
         """
         Initialize ADS interface.
@@ -60,7 +98,7 @@ class BeckhoffADSInterface:
             raise ImportError("pyads library is required. Install with: pip install pyads")
 
         self.ams_netid = ams_netid
-        self.port = port if port is not None else (pyads.PORT_TC3PLC1 if pyads else 851)
+        self.port = port if port is not None else pyads.PORT_TC3PLC1
         self.callback = callback
         self.symbol_prefix = symbol_prefix
         self.log_callback = log_callback
@@ -91,6 +129,11 @@ class BeckhoffADSInterface:
         self._last_stop_cont_state = False
         self._measurement_in_progress = False
 
+        # Polling stats (for monitor display)
+        self._poll_interval = 0.0
+        self._poll_count = 0
+        self._last_poll_time: Optional[float] = None
+
     # -----------------------------------------------------
     # Logging helper
     # -----------------------------------------------------
@@ -118,75 +161,68 @@ class BeckhoffADSInterface:
             self._last_error = "pyads library not available"
             return False
 
-        try:
-            if self.plc is not None:
-                try:
-                    if self.plc.is_open:
-                        self.plc.close()
-                except:
-                    pass
-                self.plc = None
-                time.sleep(0.1)
-
-            # On Windows: do NOT call open_port() or set_local_address().
-            # "SetLocalAddress is not supported for Windows clients" - router assigns address.
-            # open_port() can fail on Windows with "Failed to open port on AMS router" even when router is OK.
-            # Connection().open() uses a different path and may work when open_port() fails.
-            is_localhost = (self.ams_netid.startswith('127.0.0.1') or 
-                           self.ams_netid == 'localhost' or
-                           self.ams_netid == '127.0.0.1.1.1')
-
-            self.plc = pyads.Connection(self.ams_netid, self.port)
-            self.plc.open()
-            
-            if not self.plc.is_open:
-                raise Exception("Connection opened but is_open() returned False")
-            
-            self._log("connection", f"Connected to PLC at {self.ams_netid}:{self.port}")
-            self._last_error = None
-            return True
-            
-        except Exception as e:
-            error_msg = str(e)
-            self._last_error = error_msg
-            
-            # Enhanced error message for localhost
-            if is_localhost:
-                error_msg += (
-                    "\n\nTroubleshooting for localhost connection:\n"
-                    "- Ensure TwinCAT XAE is installed and System UI (TcSysUI.exe) is running\n"
-                    "- ADS Router is loaded by default with XAE\n"
-                    "- Try running as Administrator\n"
-                    "- Check if another application is using the ADS port\n"
-                    "- Verify TwinCAT is properly installed\n"
-                    "- DLL location: C:\\Program Files (x86)\\Beckhoff\\TwinCAT\\Common64"
-                )
-            
-            self._log("error", f"Connection failed: {error_msg}")
+        # Clean up any previous connection
+        if self.plc is not None:
+            try:
+                self.plc.close()
+            except Exception:
+                pass
             self.plc = None
-            return False
+
+        def _try_open(target_ams_netid: str, target_port: int):
+            plc = pyads.Connection(target_ams_netid, target_port)
+            try:
+                plc.open()
+                if not plc.is_open:
+                    raise RuntimeError("ADS connection did not open")
+                return plc, None
+            except Exception as e:
+                try:
+                    plc.close()
+                except Exception:
+                    pass
+                return None, e
+
+        # Try configured endpoint first; then optional localhost fallback.
+        attempts = [(self.ams_netid, self.port, "configured")]
+        fallback = ("127.0.0.1.1.1", pyads.PORT_TC3PLC1, "localhost fallback")
+        if (str(self.ams_netid).strip(), int(self.port)) != (fallback[0], int(fallback[1])):
+            attempts.append(fallback)
+
+        errors = []
+        for ams_netid, port, label in attempts:
+            plc, err = _try_open(ams_netid, port)
+            if plc is not None:
+                self.plc = plc
+                self._last_error = None
+                self._log("connection", f"Connected to PLC at {ams_netid}:{port} ({label})")
+                return True
+            errors.append(f"{label}: {err if err else 'Unknown error'}")
+
+        self._last_error = " | ".join(errors)
+        self._log("error", f"Connection failed: {self._last_error}")
+        return False
 
     def disconnect(self):
         """Disconnect from PLC."""
-        # Stop polling thread if running (no separate stop() method)
         self.running = False
-        if self.thread:
+
+        # Only join the polling thread if called from a different thread
+        if self.thread and self.thread is not threading.current_thread():
             self.thread.join(timeout=2.0)
             self.thread = None
+
         if self.plc:
             try:
-                if self.plc.is_open:
-                    self.plc.close()
-                # Clear log callback before logging to avoid issues during shutdown
+                self.plc.close()
                 log_cb = self.log_callback
                 self.log_callback = None
                 if log_cb:
                     try:
                         log_cb("connection", "Disconnected from PLC", {})
-                    except:
-                        pass  # Window might be destroyed
-            except Exception as e:
-                # Don't log errors during disconnect - might cause issues
+                    except Exception:
+                        pass
+            except Exception:
                 pass
             finally:
                 self.plc = None
@@ -257,6 +293,8 @@ class BeckhoffADSInterface:
             self._last_trigger_state = False
 
         self.running = True
+        self._poll_interval = poll_interval
+        self._poll_count = 0
         self.thread = threading.Thread(target=self._loop, args=(poll_interval,), daemon=True)
         self.thread.start()
         self._log("connection", f"Polling started (interval: {poll_interval}s)")
@@ -283,6 +321,15 @@ class BeckhoffADSInterface:
         """Get last error message."""
         return self._last_error
 
+    def get_polling_stats(self) -> Dict[str, Any]:
+        """Return polling stats for monitor display."""
+        return {
+            "running": self.running,
+            "interval": self._poll_interval,
+            "poll_count": self._poll_count,
+            "last_poll_time": self._last_poll_time,
+        }
+
     def get_disabled_variables(self):
         """Get disabled variables (for compatibility with monitor)."""
         return set()  # Simplified version doesn't disable variables
@@ -305,6 +352,10 @@ class BeckhoffADSInterface:
                 if not self.plc or not self.plc.is_open:
                     time.sleep(interval)
                     continue
+
+                # Update polling stats
+                self._poll_count += 1
+                self._last_poll_time = time.time()
 
                 # Read trigger
                 trigger = self._read(self.var_trigger, pyads.PLCTYPE_BOOL)
@@ -423,12 +474,23 @@ class BeckhoffADSInterface:
     # -----------------------------------------------------
 
     def _attempt_reconnect(self):
-        """Attempt to reconnect to PLC."""
+        """Attempt to reconnect to PLC (called from polling thread)."""
+        # Close only the ADS connection, do NOT call disconnect() which would
+        # set self.running=False and kill the polling thread we're running in.
+        if self.plc:
+            try:
+                self.plc.close()
+            except Exception:
+                pass
+            self.plc = None
+
+        time.sleep(0.3)
+
         try:
-            self.disconnect()
-            time.sleep(1)
             if self.connect():
                 self._log("connection", "Reconnected successfully")
+            else:
+                time.sleep(1.0)
         except Exception as e:
             self._log("error", f"Reconnect failed: {e}")
-            time.sleep(2)
+            time.sleep(1.0)

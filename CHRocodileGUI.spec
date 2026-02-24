@@ -125,6 +125,12 @@ a = Analysis(
     noarchive=False,
 )
 
+# IMPORTANT:
+# Do not bundle TwinCAT ADS runtime DLL from the build machine.
+# Use the target machine's installed TcAdsDll.dll instead.
+a.binaries = [b for b in a.binaries if os.path.basename(b[0]).lower() != "tcadsdll.dll"]
+a.datas = [d for d in a.datas if os.path.basename(d[0]).lower() != "tcadsdll.dll"]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(

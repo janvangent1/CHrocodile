@@ -7,13 +7,6 @@ Main application window for controlling CHRocodile 2 LR device.
 import os
 import sys
 
-# Fix TwinCAT DLL loading for frozen executable (no Python installed on target PC)
-# Must run BEFORE any import that loads pyads. Frozen .exe does not inherit DLL search paths.
-if getattr(sys, 'frozen', False):
-    _tc_path = r"C:\Program Files (x86)\Beckhoff\TwinCAT\Common64"
-    if os.path.exists(_tc_path):
-        os.add_dll_directory(_tc_path)
-
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
@@ -1273,7 +1266,7 @@ class CHRocodileGUI:
             ams_netid = ads_settings.get('ams_netid', '127.0.0.1.1.1')
             port = ads_settings.get('port')
             symbol_prefix = ads_settings.get('symbol_prefix', 'GVL_CHRocodile.')
-            write_timeout = ads_settings.get('write_timeout', 1.0)  # Default 1.0s for slow networks
+            write_timeout = ads_settings.get('write_timeout', 0.5)
             
             # Check if AMS NetID is changing - if so, ensure old connection is fully closed
             old_ams_netid = getattr(self, 'beckhoff_ams_netid', None)
@@ -1284,9 +1277,9 @@ class CHRocodileGUI:
                         self.beckhoff_ads_interface.stop_polling()
                     # Force disconnect to ensure port is released
                     self.beckhoff_ads_interface.disconnect()
-                    # Additional delay to ensure port is released when switching connections
+                    # Brief delay to ensure port is released when switching connections
                     import time
-                    time.sleep(0.3)
+                    time.sleep(0.1)
                     if self.log_callback:
                         self.log_callback("connection", f"Switching from {old_ams_netid} to {ams_netid} - old connection closed", {})
             
@@ -1338,7 +1331,7 @@ class CHRocodileGUI:
             
             self.beckhoff_ads_interface = BeckhoffADSInterface(
                 ams_netid=ams_netid,
-                port=port if port is not None else (pyads.PORT_TC3PLC1 if pyads else None),
+                port=port if port is not None else pyads.PORT_TC3PLC1,
                 callback=self._beckhoff_command_callback,
                 symbol_prefix=symbol_prefix,
                 log_callback=combined_log_callback,
@@ -1379,7 +1372,7 @@ class CHRocodileGUI:
                     self.beckhoff_ads_interface.var_error = f"{symbol_prefix}{variables['error']}"
             
             # Get poll interval from settings
-            poll_interval = ads_settings.get('poll_interval', 0.1)
+            poll_interval = ads_settings.get('poll_interval', 0.05)
             
             if self.beckhoff_enabled:
                 if self.beckhoff_ads_interface.start_polling(poll_interval=poll_interval):
@@ -1473,7 +1466,7 @@ class CHRocodileGUI:
             if self.beckhoff_ads_interface and not self.beckhoff_ads_interface.is_running():
                 # Get poll interval from settings
                 ads_settings = self.settings_manager.get_ads_settings()
-                poll_interval = ads_settings.get('poll_interval', 0.1)
+                poll_interval = ads_settings.get('poll_interval', 0.05)
                 
                 if self.beckhoff_ads_interface.start_polling(poll_interval=poll_interval):
                     self._log_status(f"Beckhoff ADS interface enabled (AMS: {self.beckhoff_ams_netid})")
@@ -1546,8 +1539,8 @@ class CHRocodileGUI:
         ams_netid_var = tk.StringVar(value=ads_settings.get('ams_netid', '127.0.0.1.1.1'))
         port_var = tk.StringVar(value=str(ads_settings.get('port', '')) if ads_settings.get('port') else '')
         symbol_prefix_var = tk.StringVar(value=ads_settings.get('symbol_prefix', 'GVL_CHRocodile.'))
-        poll_interval_var = tk.StringVar(value=str(ads_settings.get('poll_interval', 0.1)))
-        write_timeout_var = tk.StringVar(value=str(ads_settings.get('write_timeout', 1.0)))
+        poll_interval_var = tk.StringVar(value=str(ads_settings.get('poll_interval', 0.05)))
+        write_timeout_var = tk.StringVar(value=str(ads_settings.get('write_timeout', 0.5)))
         
         # Variable name variables
         var_vars = {}
@@ -1580,7 +1573,7 @@ class CHRocodileGUI:
         ttk.Label(conn_frame, text="Poll Interval (seconds):").grid(row=3, column=0, sticky=tk.W, pady=5)
         poll_entry = ttk.Entry(conn_frame, textvariable=poll_interval_var, width=30)
         poll_entry.grid(row=3, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=5)
-        ttk.Label(conn_frame, text="(Default: 0.1 = 100ms)", 
+        ttk.Label(conn_frame, text="(Default: 0.05 = 50ms)", 
                  font=("Arial", 8), foreground="gray").grid(row=3, column=2, sticky=tk.W, padx=(5, 0))
         
         ttk.Label(conn_frame, text="Write Timeout (seconds):").grid(row=4, column=0, sticky=tk.W, pady=5)
@@ -1704,9 +1697,9 @@ class CHRocodileGUI:
                     # Stop polling but keep connection and state
                     self.beckhoff_ads_interface.stop_polling()
                     # Note: stop_polling() disconnects, so we need to reconnect
-                    # Add delay to ensure port is fully released before reconnecting
+                    # Brief delay to ensure port is fully released before reconnecting
                     import time
-                    time.sleep(0.3)
+                    time.sleep(0.1)
                 
                 # Reinitialize interface with new settings (creates new instance)
                 # This resets state, but start_polling will read current trigger state
@@ -1714,7 +1707,7 @@ class CHRocodileGUI:
                 
                 if was_running and self.beckhoff_ads_interface:
                     ads_settings = self.settings_manager.get_ads_settings()
-                    poll_interval = ads_settings.get('poll_interval', 0.1)
+                    poll_interval = ads_settings.get('poll_interval', 0.05)
                     # start_polling will read current trigger state to avoid false trigger
                     self.beckhoff_ads_interface.start_polling(poll_interval=poll_interval)
                     self.beckhoff_status_label.config(text=f"Status: On ({ams_netid})", foreground="green")
@@ -1794,9 +1787,18 @@ class BeckhoffADSMonitor:
         # Status frame
         status_frame = ttk.LabelFrame(main_frame, text="Connection Status", padding="10")
         status_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        self.status_label = ttk.Label(status_frame, text="Not connected", foreground="gray")
+
+        # Row 1: Connection
+        row1 = ttk.Frame(status_frame)
+        row1.pack(fill=tk.X)
+        self.status_label = ttk.Label(row1, text="Not connected", foreground="gray")
         self.status_label.pack(side=tk.LEFT, padx=(0, 20))
+
+        # Row 2: Polling stats
+        row2 = ttk.Frame(status_frame)
+        row2.pack(fill=tk.X, pady=(8, 0))
+        self.polling_label = ttk.Label(row2, text="Polling: —", foreground="gray")
+        self.polling_label.pack(side=tk.LEFT)
         
         if ads_interface:
             ams_netid = ads_interface.ams_netid
@@ -1966,20 +1968,45 @@ class BeckhoffADSMonitor:
         self._update_display()
     
     def _update_status(self):
-        """Update connection status."""
+        """Update connection status and polling stats."""
         if self.ads_interface:
             connected = self.ads_interface.is_connected()
             running = self.ads_interface.is_running()
-            
+
             if connected:
                 ams_netid = self.ads_interface.ams_netid
                 port = self.ads_interface.port if self.ads_interface.port else "851 (default)"
-                self.status_label.config(text=f"Connected to {ams_netid}:{port}", 
-                                       foreground="green")
+                self.status_label.config(text=f"Connected to {ams_netid}:{port}",
+                                        foreground="green")
             elif running:
                 self.status_label.config(text="Connecting...", foreground="orange")
             else:
                 self.status_label.config(text="Disconnected", foreground="gray")
+
+            # Polling stats
+            stats = self.ads_interface.get_polling_stats()
+            if stats.get("running"):
+                interval_s = stats.get("interval", 0)
+                count = stats.get("poll_count", 0)
+                last = stats.get("last_poll_time")
+                interval_ms = int(interval_s * 1000) if interval_s else 0
+                if last is not None:
+                    ago = time.time() - last
+                    ago_str = f"{ago:.1f}s ago" if ago < 60 else f"{int(ago)}s ago"
+                    self.polling_label.config(
+                        text=f"Polling: active | interval {interval_ms} ms | polls: {count} | last: {ago_str}",
+                        foreground="green"
+                    )
+                else:
+                    self.polling_label.config(
+                        text=f"Polling: active | interval {interval_ms} ms | polls: {count}",
+                        foreground="green"
+                    )
+            else:
+                self.polling_label.config(text="Polling: inactive", foreground="gray")
+        else:
+            self.status_label.config(text="Not connected", foreground="gray")
+            self.polling_label.config(text="Polling: —", foreground="gray")
     
     def _update_status_loop(self):
         """Periodically update status."""

@@ -75,72 +75,149 @@ print()
 print("Note: On Windows, set_local_address() is not used (router assigns address automatically).")
 print()
 
-# Test 1: Low-level open_port()
-print("Test 1: pyads.open_port() ...")
-err1 = None
+# ---- Test 1: Connection (same pattern as working colleague script) ----
+print("Test 1: pyads.Connection('127.0.0.1.1.1', pyads.PORT_TC3PLC1) ...")
+plc = None
+test1_ok = False
 try:
-    port = pyads.open_port()
-    print(f"  -> Port opened: {port}")
-    pyads.close_port()
-    print("  -> Port closed. SUCCESS.")
+    plc = pyads.Connection("127.0.0.1.1.1", pyads.PORT_TC3PLC1)
+    plc.open()
+    print("  -> Connection opened. SUCCESS.")
     test1_ok = True
 except Exception as e:
     print(f"  -> FAILED: {e}")
-    err1 = e
-    test1_ok = False
-    # Show ADS error code if present
     if hasattr(e, "ads_err_code"):
         print(f"  -> ADS error code: {e.ads_err_code}")
-print()
-
-# Test 2: High-level Connection (what the main app uses)
-print("Test 2: pyads.Connection('127.0.0.1.1.1', 851).open() ...")
-conn = None
-err2 = None
-try:
-    conn = pyads.Connection("127.0.0.1.1.1", 851)
-    conn.open()
-    print("  -> Connection opened. SUCCESS.")
-    if conn.is_open:
-        conn.close()
-        print("  -> Connection closed.")
-    test2_ok = True
-except Exception as e:
-    print(f"  -> FAILED: {e}")
-    err2 = e
-    test2_ok = False
-    if hasattr(e, "ads_err_code"):
-        print(f"  -> ADS error code: {e.ads_err_code}")
-    if conn is not None:
+finally:
+    if plc is not None:
         try:
-            conn.close()
+            if plc.is_open:
+                plc.close()
+            print("  -> Connection closed.")
         except Exception:
             pass
 print()
 
-# Summary
+# ---- Test 2: Connection + read_state (PLC reachability) ----
+print("Test 2: Connection + plc.read_state() ...")
+plc = None
+test2_ok = False
+try:
+    plc = pyads.Connection("127.0.0.1.1.1", pyads.PORT_TC3PLC1)
+    plc.open()
+    state = plc.read_state()
+    print(f"  -> read_state() OK: ads_state={state.ads_state}, device_state={state.device_state}")
+    test2_ok = True
+except Exception as e:
+    print(f"  -> FAILED: {e}")
+    if hasattr(e, "ads_err_code"):
+        print(f"  -> ADS error code: {e.ads_err_code}")
+finally:
+    if plc is not None:
+        try:
+            if plc.is_open:
+                plc.close()
+            print("  -> Connection closed.")
+        except Exception:
+            pass
+print()
+
+# ---- Test 3: Read a known test variable (like colleague script) ----
+print("Test 3: Read GVL_Test.counter (DINT) ...")
+plc = None
+test3_ok = False
+try:
+    plc = pyads.Connection("127.0.0.1.1.1", pyads.PORT_TC3PLC1)
+    plc.open()
+    counter = plc.read_by_name("GVL_Test.counter", pyads.PLCTYPE_DINT)
+    print(f"  -> GVL_Test.counter = {counter}. SUCCESS.")
+    test3_ok = True
+except pyads.ADSError as e:
+    print(f"  -> FAILED: {e}")
+    if hasattr(e, "err_code"):
+        print(f"  -> ADS error code: {e.err_code}")
+    if "not found" in str(e).lower() or e.err_code == 1808:
+        print("  -> Variable 'GVL_Test.counter' does not exist in PLC program.")
+        print("     This is OK if your PLC uses a different GVL name.")
+except Exception as e:
+    print(f"  -> FAILED: {e}")
+finally:
+    if plc is not None:
+        try:
+            if plc.is_open:
+                plc.close()
+        except Exception:
+            pass
+print()
+
+# ---- Test 4: Read GVL_CHRocodile variables (what the main app uses) ----
+print("Test 4: Read GVL_CHRocodile.bTriggerMeasurement (BOOL) ...")
+plc = None
+test4_ok = False
+try:
+    plc = pyads.Connection("127.0.0.1.1.1", pyads.PORT_TC3PLC1)
+    plc.open()
+    val = plc.read_by_name("GVL_CHRocodile.bTriggerMeasurement", pyads.PLCTYPE_BOOL)
+    print(f"  -> GVL_CHRocodile.bTriggerMeasurement = {val}. SUCCESS.")
+    test4_ok = True
+except pyads.ADSError as e:
+    print(f"  -> FAILED: {e}")
+    if hasattr(e, "err_code"):
+        print(f"  -> ADS error code: {e.err_code}")
+    if "not found" in str(e).lower() or (hasattr(e, "err_code") and e.err_code == 1808):
+        print("  -> Variable 'GVL_CHRocodile.bTriggerMeasurement' does NOT exist on this PLC!")
+        print("     *** THIS is why the main app fails locally but works remotely. ***")
+        print("     The GVL_CHRocodile variables only exist on the remote PLC.")
+except Exception as e:
+    print(f"  -> FAILED: {e}")
+finally:
+    if plc is not None:
+        try:
+            if plc.is_open:
+                plc.close()
+        except Exception:
+            pass
+print()
+
+# ---- Summary ----
+print("=" * 60)
+print("SUMMARY")
+print("=" * 60)
+
 if test1_ok and test2_ok:
-    print("All tests passed. ADS router is OK.")
-elif test2_ok and not test1_ok:
-    print("Connection() works but open_port() fails.")
-    print("-> Main app uses Connection() so it may still work.")
-elif test1_ok and not test2_ok:
-    print("open_port() works but Connection() fails.")
-    print("-> Check PLC is in RUN and port 851 is correct.")
+    print("Connection to local PLC: OK")
 else:
-    print("Both tests failed. Next steps:")
+    print("Connection to local PLC: FAILED")
+    print("  -> Check TwinCAT System Service (TcSysSrv) is RUNNING")
+    print("  -> Try running as Administrator")
     print()
-    print("  If TcSysSrv is RUNNING (and TcAdsRouter not installed - normal for XAE):")
-    print("  - Run this exe from a LOCAL folder (e.g. C:\\Temp\\ADS_Troubleshoot.exe).")
-    print("    Do NOT run from a network drive or OneDrive-synced folder.")
-    print("  - Add TwinCAT to PATH for this session, then run the exe again:")
-    print('    set PATH=%%PATH%%;C:\\Program Files (x86)\\Beckhoff\\TwinCAT\\Common64')
-    print("    (Open cmd, run the set command, then run the exe from the same window.)")
-    print("  - Start TcSysUI.exe if not running; wait 10 s; run this tool again.")
-    print("  - Restart the PC (another process may hold the only ADS client port).")
+
+if test3_ok:
+    print("GVL_Test.counter: EXISTS (colleague's test variable)")
+elif test1_ok:
+    print("GVL_Test.counter: NOT FOUND (not critical)")
+
+if test4_ok:
+    print("GVL_CHRocodile variables: EXISTS (main app will work)")
+elif test1_ok:
+    print("GVL_CHRocodile variables: NOT FOUND")
     print()
-    print("  To see if the problem is the frozen exe:")
-    print("  - Install Python on this PC, copy ads_troubleshoot.py, run: python ads_troubleshoot.py")
-    print("  - If the script works but the exe fails, the issue is specific to the frozen executable.")
+    print("  *** ROOT CAUSE: The main app fails locally because the PLC program")
+    print("      on this PC does not have GVL_CHRocodile variables. ***")
+    print()
+    print("  Your colleague's script works because it reads GVL_Test.counter,")
+    print("  which DOES exist on this PLC.")
+    print()
+    print("  To fix this, either:")
+    print("  1. Add GVL_CHRocodile to the local PLC program, OR")
+    print("  2. Change the symbol_prefix in chrocodile_settings.json to match")
+    print("     the local PLC's GVL name (e.g., 'GVL_Test.')")
+
+if not test1_ok:
+    print()
+    print("Additional troubleshooting:")
+    print("  - Run from a LOCAL folder (not OneDrive/network drive)")
+    print("  - Ensure TcSysUI.exe is running in the system tray")
+    print("  - Restart the PC if needed")
 print()
 input("Press Enter to exit...")
