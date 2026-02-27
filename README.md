@@ -128,7 +128,7 @@ python chrocodile_gui.py
 
 ### Connecting to Device
 
-1. Enter the IP address of your CHRocodile device (default: `192.168.170.3`)
+1. Enter the IP address of your CHRocodile device (default: `192.168.170.2`)
    - **Note**: Different CHRocodile 2 variants may use different default IP addresses
    - You can configure the device IP address after connecting using the "Configure Device IP" button
 2. Click "Connect" button

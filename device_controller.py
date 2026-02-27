@@ -89,7 +89,7 @@ class CHRocodileController:
         Connect to the CHRocodile device.
         
         Args:
-            ip_address: IP address of the device (e.g., '192.168.170.3')
+            ip_address: IP address of the device (e.g., '192.168.170.2')
             
         Returns:
             Tuple of (success: bool, message: str)
@@ -165,46 +165,48 @@ class CHRocodileController:
         if not self.connection:
             return
         
+        def _exec_checked(cmd: str, *args):
+            """Execute device command and raise a clear error on failure."""
+            try:
+                resp = self.connection.exec(cmd, *args)
+            except Exception as e:
+                raise Exception(f"{cmd}{args}: transport/exec error: {e}")
+            if resp.error_code != 0:
+                raise Exception(f"{cmd}{args}: device error_code={resp.error_code}")
+            return resp
+
         try:
             # Set measuring mode FIRST (interferometric for thickness)
             # This must be set before configuring signals
-            resp = self.connection.exec('MMD', self.measuring_mode)
-            if resp.error_code != 0:
-                raise APIException(self.connection.dll_handle(), resp.error_code)
+            _exec_checked('MMD', self.measuring_mode)
             
             # Set number of peaks to 2 (for film thickness measurement)
-            resp = self.connection.exec('NOP', 2)
-            if resp.error_code != 0:
-                raise APIException(self.connection.dll_handle(), resp.error_code)
+            _exec_checked('NOP', 2)
             
             # Set output signals: sample counter (optional) + thickness (256)
             # Signal 256 = Thickness 1 in float format (already includes refractive index correction)
             # For interferometric mode, we use signal 256, not peak signals 16640/16641
-            resp = self.connection.exec('SODX', self.SIGNAL_SAMPLE_COUNTER, self.SIGNAL_THICKNESS)
-            if resp.error_code != 0:
-                raise APIException(self.connection.dll_handle(), resp.error_code)
+            # Some firmware variants reject mixed signal lists; fallback to thickness-only.
+            try:
+                _exec_checked('SODX', self.SIGNAL_SAMPLE_COUNTER, self.SIGNAL_THICKNESS)
+            except Exception:
+                _exec_checked('SODX', self.SIGNAL_THICKNESS)
             
             # Set measuring rate
-            resp = self.connection.exec('SHZ', self.measuring_rate_hz)
-            if resp.error_code != 0:
-                raise APIException(self.connection.dll_handle(), resp.error_code)
+            _exec_checked('SHZ', self.measuring_rate_hz)
             
             # Set averaging
-            resp = self.connection.exec('AVD', self.data_average)
-            if resp.error_code != 0:
-                raise APIException(self.connection.dll_handle(), resp.error_code)
+            _exec_checked('AVD', self.data_average)
             
-            resp = self.connection.exec('AVS', self.spectrum_average)
-            if resp.error_code != 0:
-                raise APIException(self.connection.dll_handle(), resp.error_code)
+            _exec_checked('AVS', self.spectrum_average)
             
             # Set lamp intensity
-            resp = self.connection.exec('LIA', self.lamp_intensity)
-            if resp.error_code != 0:
-                raise APIException(self.connection.dll_handle(), resp.error_code)
+            _exec_checked('LIA', self.lamp_intensity)
             
             # Set refractive index if it's been changed from default
-            self.set_refractive_index(self.refractive_index)
+            ok, msg = self.set_refractive_index(self.refractive_index)
+            if not ok:
+                raise Exception(msg)
             
         except Exception as e:
             raise Exception(f"Failed to setup measurement: {str(e)}")

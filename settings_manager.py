@@ -37,7 +37,7 @@ class SettingsManager:
             }
         },
         "device": {
-            "default_ip": "192.168.170.3"
+            "default_ip": "192.168.170.2"
         }
     }
     

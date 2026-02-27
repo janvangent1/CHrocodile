@@ -113,7 +113,7 @@ class CHRocodileGUI:
         
         ttk.Label(conn_frame, text="IP Address:").grid(row=0, column=0, padx=(0, 5))
         self.ip_entry = ttk.Entry(conn_frame, width=15)
-        self.ip_entry.insert(0, "192.168.170.3")
+        self.ip_entry.insert(0, "192.168.170.2")
         self.ip_entry.grid(row=0, column=1, padx=(0, 5))
         
         self.config_ip_btn = ttk.Button(conn_frame, text="Configure Device IP", 
@@ -584,7 +584,7 @@ class CHRocodileGUI:
             "2. Reconnect using the new IP address\n"
             "3. The device may need to be restarted for changes to take effect\n\n"
             f"Current IP: {current_ip}\n"
-            "Default IP for CHRocodile 2 LR: 192.168.170.3"
+            "Default IP for CHRocodile 2 LR: 192.168.170.2"
         )
         
         warning_label = ttk.Label(warning_frame, text=warning_text, 
