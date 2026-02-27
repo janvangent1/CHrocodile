@@ -45,9 +45,8 @@ Thumbs.db
 *.log
 test_*.py
 
-# Exclude docs and chrocodilelib folders
+# Exclude docs folder
 docs/
-chrocodilelib/
 
 # Settings file (contains user-specific configuration)
 chrocodile_settings.json

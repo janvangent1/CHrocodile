@@ -1,0 +1,66 @@
+SOFTWARE LICENSE AGREEMENT
+
+
+1. Subject Matter and Acceptance of this Agreement
+
+This is a Software License Agreement between Precitec Optronik GmbH (hereinafter referred to as Precitec Optronik) and You. Subject matter of this Software License Agreement is the Explorer Software (CHRocodileExplorer, CLSExplorer, CVCExplorer, FSSExplorer, and necessary supporting Software) and CHRocodileLib of Precitec Optronik (hereinafter referred to as Software). The Software may only be used and copied in accordance with the terms and conditions of this agreement.
+
+By installing and running the Software, You agree to be bound by the terms and conditions of this agreement.
+
+
+
+2. License 
+
+Precitec Optronik hereby grants You a perpetual, worldwide, non-transferable, and non-exclusive license without license fees to copy the object code of the Software on as many of Your computers as You wish, to install, and to run the Software according to its intended purpose as described in section 3. 
+
+You are permitted to bundle the Software with Your programs and to integrate the Software in Your programs. 
+
+For the purpose of further distribution of the Software bundled with or integrated in Your program, Precitec Optronik hereby grants You a perpetual, worldwide, non-transferable, and non-exclusive right without license fees to redistribute copies of the Software provided that You distribute the Software complete and unmodified and only bundled with or integrated as part of Your program. The right to redistribute copies of the Software is limited to its intended purposes as described in section 3.
+
+You and the recipient of Your program are permitted to modify the Software for Your and the recipients own purpose and to reverse engineer the Software for debugging such modifications.
+
+
+
+3. Purpose of Use 
+
+The Explorer Software is designed to enable You to operate Precitec Optronik products, to configure the control unit, to visualize data, and to view log information. 
+
+The CHRocodileLib is designed to provide a universal interface for integrating Precitec Optronik optical sensors and for communicating with Precitec Optronik optical sensors to acquire respective data.
+
+The Software may be bundled with and integrated in Your program [Middleware] and distributed complete and unmodified and only bundled or integrated as part of Your programs and for the purpose of use mentioned above.
+
+
+
+4. Testing
+
+If You distribute the Software bundled with or integrated in Your program, You must test the Software bundled with or integrated in Your program before distribution. Distribution of the Software bundled with or integrated in Your program will be at Your own responsibility. Precitec Optronik provides no warranty for any malfunction resulting from your bundling or integrating the Software in Your program.
+
+
+
+5. Trademarks
+
+Product and company names mentioned herein or in any other documentation are or may be trademarks of their respective companies and are not licensed under this agreement. 
+
+
+
+6. Updates
+
+This agreement will also be applicable for updates of the Software.
+
+
+
+7. Warranty and Disclaimer
+
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, Precitec Optronik HEREBY DISCLAIMS ALL EXPRESS OR IMPLIED REPRESENTATIONS, WARRANTIES, GUARANTEES, AND CONDITIONS OF ANY KIND, ARISING BY LAW OR OTHERWISE, WITH REGARD TO THE SOFTWARE. 
+
+EXCEPT WHERE EXPRESSLY PROVIDED OTHERWISE BY Precitec Optronik, THE PROGRAM IS PROVIDED TO YOU ON AN “AS IS” BASIS WITHOUT ANY WARRANTY OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE. 
+
+IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING WILL Precitec Optronik BE LIABLE TO YOU FOR DAMAGES INCLUDING ANY GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE USE OR INABILITY TO USE THE SOFTWARE.
+
+
+
+8. Governing Law and Jurisdiction
+
+This agreement is governed by and shall be construed in accordance with the laws of Germany. All disputes arising in connection with this agreement shall be submitted to the exclusive jurisdiction of the Court of Frankfurt am Main.
+
+

@@ -1,0 +1,41 @@
+cmake_minimum_required(VERSION 3.9)
+
+project(Demo_Plugin_FlyingSpot)
+
+set(CMAKE_INCLUDE_CURRENT_DIR ON)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_EXTENSIONS ON)
+
+file(GLOB sources "*.h" "*.cpp")
+
+if("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
+    set(OUT_DIR "${CMAKE_CURRENT_LIST_DIR}/${CMAKE_BUILD_TYPE}/win64")
+else()
+    set(OUT_DIR "${CMAKE_CURRENT_LIST_DIR}/${CMAKE_BUILD_TYPE}/win32")
+endif()
+
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${OUT_DIR})
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${OUT_DIR})
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${OUT_DIR})
+
+add_executable(${PROJECT_NAME} ${sources})
+
+add_custom_command(
+    TARGET ${PROJECT_NAME}
+    POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy TestRecipe.rs ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
+        COMMAND ${CMAKE_COMMAND} -E copy 49_points_inf.rs ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
+        COMMAND ${CMAKE_COMMAND} -E copy ../ScannerGlobalConfig.cfg ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Copying example script and FSS config file to the output directory"
+    VERBATIM
+)
+
+add_definitions(-DPLUGIN_PATH=".")
+target_include_directories(${PROJECT_NAME} PUBLIC "../include" )
+if("${CMAKE_SIZEOF_VOID_P}" EQUAL "8")
+    target_link_directories(${PROJECT_NAME} PUBLIC "${CMAKE_SOURCE_DIR}/../lib/win/x64")
+else()
+    target_link_directories(${PROJECT_NAME} PUBLIC "${CMAKE_SOURCE_DIR}/../lib/win/Win32")
+endif()
+target_link_libraries(${PROJECT_NAME} PUBLIC CHRocodile)
