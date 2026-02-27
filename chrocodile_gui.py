@@ -428,27 +428,34 @@ class CHRocodileGUI:
             self.thickness_label.config(text=f"{thickness:.2f} μm")
         
         peak1 = data.get('peak1')
-        if peak1 is not None:
-            self.peak1_label.config(text=f"{peak1:.1f}")
-        
         peak2 = data.get('peak2')
-        if peak2 is not None:
-            self.peak2_label.config(text=f"{peak2:.1f}")
-        
-        # Update plot
-        timestamp = data.get('timestamp', time.time())
-        if thickness is not None:
-            self.plotter.update_thickness_plot(timestamp, thickness)
-        
+
         # Update spectrum plot if spectrum data is available
         spectrum = data.get('spectrum')
         if spectrum is not None:
-            # Use peak positions from measurement data if available
-            peak1_pos = None
-            peak2_pos = None
-            # Try to find peak positions from spectrum
+            # Detect peaks from raw spectrum and use them as fallback when device
+            # does not provide peak values directly in measurement response.
             peak1_pos, peak2_pos = self._detect_peaks(spectrum)
+            if peak1 is None:
+                peak1 = peak1_pos
+            if peak2 is None:
+                peak2 = peak2_pos
             self.plotter.update_raw_data_plot(spectrum, peak1_pos, peak2_pos)
+        
+        if peak1 is not None:
+            self.peak1_label.config(text=f"{peak1:.1f}")
+        else:
+            self.peak1_label.config(text="--")
+
+        if peak2 is not None:
+            self.peak2_label.config(text=f"{peak2:.1f}")
+        else:
+            self.peak2_label.config(text="--")
+
+        # Update thickness plot
+        timestamp = data.get('timestamp', time.time())
+        if thickness is not None:
+            self.plotter.update_thickness_plot(timestamp, thickness)
         
         # Update count
         self.measurement_count += 1
@@ -456,18 +463,21 @@ class CHRocodileGUI:
         
         # Log measurement to file
         if hasattr(self, 'logger'):
-            thickness = data.get('thickness')
-            peak1 = data.get('peak1')
-            peak2 = data.get('peak2')
-            self.logger.info(f"Measurement #{self.measurement_count}: Thickness={thickness:.3f} μm, Peak1={peak1:.1f}, Peak2={peak2:.1f}")
+            thickness_text = f"{thickness:.3f}" if thickness is not None else "N/A"
+            peak1_text = f"{peak1:.1f}" if peak1 is not None else "N/A"
+            peak2_text = f"{peak2:.1f}" if peak2 is not None else "N/A"
+            self.logger.info(
+                f"Measurement #{self.measurement_count}: "
+                f"Thickness={thickness_text} μm, Peak1={peak1_text}, Peak2={peak2_text}"
+            )
         
         # Send measurement result to Beckhoff PLC via ADS if interface is active
         # This ensures PLC-triggered measurements complete the handshake properly
         if self.beckhoff_ads_interface and self.beckhoff_ads_interface.is_running():
             plc_data = {
-                "thickness": data.get('thickness'),
-                "peak1": data.get('peak1'),
-                "peak2": data.get('peak2'),
+                "thickness": thickness,
+                "peak1": peak1,
+                "peak2": peak2,
                 "timestamp": data.get('timestamp'),
                 "measurement_count": self.measurement_count
             }

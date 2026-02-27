@@ -67,7 +67,8 @@ class MeasurementPlotter:
         self.ax_thickness.set_xlabel('Measurement Number')
         self.ax_thickness.set_ylabel('Thickness (μm)')
         self.ax_thickness.grid(True, alpha=0.3)
-        self.ax_thickness.set_ylim(50, 130)  # Typical range for 60-120 microns
+        self.ax_thickness.set_xlim(0.5, 10.5)
+        self.ax_thickness.set_ylim(50, 130)  # Initial range; runtime updates auto-scale
         
         # Initialize empty line
         self.line_thickness, = self.ax_thickness.plot([], [], 'b-', linewidth=1.5, marker='o', markersize=4, label='Thickness')
@@ -81,7 +82,9 @@ class MeasurementPlotter:
         self.ax_spectrum.grid(True, alpha=0.3)
         
         # Initialize empty line
-        self.line_spectrum, = self.ax_spectrum.plot([], [], 'b-', linewidth=1.0, label='Spectrum')
+        self.line_spectrum, = self.ax_spectrum.plot(
+            [], [], 'b-', linewidth=1.2, antialiased=True, label='Spectrum'
+        )
         self.peak_markers = None
         self.ax_spectrum.legend()
         
@@ -114,22 +117,20 @@ class MeasurementPlotter:
         
         # Auto-scale axes
         if len(measurement_numbers) > 0:
-            # Show all measurements with some margin
+            # Show all collected measurements
             x_min = 0.5
-            x_max = max(len(measurement_numbers) + 0.5, 10.5)  # At least show 10 measurements
-            
-            # If we have many measurements, show a rolling window of the last 50
-            if len(measurement_numbers) > 50:
-                x_min = len(measurement_numbers) - 49.5
-                x_max = len(measurement_numbers) + 0.5
-            
+            x_max = max(len(measurement_numbers) + 0.5, 10.5)
             self.ax_thickness.set_xlim(x_min, x_max)
-            
-            # Auto-scale y-axis with some margin
+
+            # Auto-scale y-axis with dynamic margin (no fixed 50..130 clamp)
             if len(values) > 0:
-                y_min = max(50, np.min(values) - 5)
-                y_max = min(130, np.max(values) + 5)
-                self.ax_thickness.set_ylim(y_min, y_max)
+                y_data_min = float(np.min(values))
+                y_data_max = float(np.max(values))
+                y_span = y_data_max - y_data_min
+                y_margin = max(1.0, y_span * 0.1)
+                if y_span == 0:
+                    y_margin = max(1.0, abs(y_data_max) * 0.05)
+                self.ax_thickness.set_ylim(y_data_min - y_margin, y_data_max + y_margin)
         
         # Redraw canvas
         if self.canvas_thickness is not None:
@@ -150,9 +151,32 @@ class MeasurementPlotter:
         
         # Create x-axis (pixel numbers)
         x = np.arange(len(spectrum))
-        
-        # Update line data
-        self.line_spectrum.set_data(x, spectrum)
+
+        # Choose an x-window that contains all detected peaks plus some margin.
+        x_min = 0
+        x_max = len(spectrum) - 1
+        valid_peaks = [
+            p for p in (peak1_pos, peak2_pos)
+            if p is not None and 0 <= p < len(spectrum)
+        ]
+        if valid_peaks:
+            p_min = min(valid_peaks)
+            p_max = max(valid_peaks)
+            base_span = max(10, p_max - p_min)
+            margin = max(5, int(base_span * 0.5))
+            x_min = max(0, p_min - margin)
+            x_max = min(len(spectrum) - 1, p_max + margin)
+
+        visible_x = x[x_min:x_max + 1]
+        visible_y = spectrum[x_min:x_max + 1]
+
+        if len(visible_x) >= 2:
+            interp_factor = 8  # Display-only densification
+            dense_x = np.linspace(visible_x[0], visible_x[-1], len(visible_x) * interp_factor)
+            dense_y = np.interp(dense_x, visible_x, visible_y)
+            self.line_spectrum.set_data(dense_x, dense_y)
+        else:
+            self.line_spectrum.set_data(visible_x, visible_y)
         
         # Remove old peak markers if they exist
         if self.peak_markers:
@@ -176,11 +200,12 @@ class MeasurementPlotter:
             if self.peak_markers:
                 self.ax_spectrum.legend()
         
-        # Auto-scale axes
-        self.ax_spectrum.set_xlim(0, len(spectrum))
-        if len(spectrum) > 0:
+        # Auto-scale x-axis so both peaks and some margin are visible
+        if len(visible_x) > 0:
+            self.ax_spectrum.set_xlim(float(visible_x[0]), float(visible_x[-1]))
+        if len(visible_y) > 0:
             y_min = 0
-            y_max = np.max(spectrum) * 1.1
+            y_max = np.max(visible_y) * 1.1
             self.ax_spectrum.set_ylim(y_min, y_max)
         
         # Redraw canvas
@@ -205,7 +230,7 @@ class MeasurementPlotter:
         # Reset axes
         self.ax_thickness.set_xlim(0.5, 10.5)
         self.ax_thickness.set_ylim(50, 130)
-        self.ax_spectrum.set_xlim(0, 1200)
+        self.ax_spectrum.set_xlim(0, 100)
         self.ax_spectrum.set_ylim(0, 10000)
         
         # Redraw

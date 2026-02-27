@@ -200,8 +200,15 @@ class CHRocodileController:
             
             _exec_checked('AVS', self.spectrum_average)
             
-            # Set lamp intensity
-            _exec_checked('LIA', self.lamp_intensity)
+            # Set lamp intensity.
+            # Some devices / firmware variants may reject this command or
+            # require different permissions. Treat this as a non-fatal issue
+            # so the rest of the measurement pipeline can still operate.
+            try:
+                _exec_checked('LIA', self.lamp_intensity)
+            except Exception as e:
+                # Log but do not abort setup if lamp configuration fails
+                print(f"Warning: failed to set lamp intensity with LIA({self.lamp_intensity,}): {e}")
             
             # Set refractive index if it's been changed from default
             ok, msg = self.set_refractive_index(self.refractive_index)
@@ -326,7 +333,13 @@ class CHRocodileController:
             # Signal 256 in float format already includes refractive index correction
             # Value is already geometrical thickness in micrometers - NO manual correction needed!
             thickness_values = data.get_signal_values(self.SIGNAL_THICKNESS, 0)
-            thickness = float(thickness_values[0]) if len(thickness_values) > 0 else None
+
+            # Some API versions return a scalar, others an array-like object.
+            # Handle both robustly to avoid "object of type 'numpy.float64' has no len()".
+            if isinstance(thickness_values, (float, int, np.floating)):
+                thickness = float(thickness_values)
+            else:
+                thickness = float(thickness_values[0]) if len(thickness_values) > 0 else None
             
             # For interferometric mode, peak signals are not the same as confocal mode
             # We can try to get peak positions from spectrum if needed, but for now

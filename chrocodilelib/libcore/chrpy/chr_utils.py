@@ -706,7 +706,8 @@ def get_command_response(dll_h: CDLL, rsp_h: int, response: Response = None) -> 
                 rsp_data_list.append(data)
             elif argtype == RspParamType.STRING:
                 data, length, err = get_response_string_arg(dll_h, rsp_h, i)
-                rsp_data_list.append(data.tostring().decode('utf-8') if data is not None else data)
+                # NumPy 2 removed ndarray.tostring(); use tobytes() for compatibility.
+                rsp_data_list.append(data.tobytes().decode('utf-8') if data is not None else data)
             elif argtype == RspParamType.BYTE_ARRAY:
                 data_array, length, err = get_response_blob_arg(dll_h, rsp_h, i)
                 rsp_data_list.append(data_array)
