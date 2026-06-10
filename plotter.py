@@ -94,7 +94,7 @@ class MeasurementPlotter:
             [], [], color='orange', linestyle='--', linewidth=1.3, marker='x', markersize=4, label='Median 1'
         )
         self.line_thickness_rejected, = self.ax_thickness.plot(
-            [], [], 'ro', linewidth=0, markersize=6, label='Below quality threshold'
+            [], [], 'ro', linewidth=0, markersize=7, label='Below quality threshold', zorder=5
         )
         self.ax_thickness.legend()
         
@@ -177,12 +177,17 @@ class MeasurementPlotter:
         # Use measurement number (1, 2, 3, ...) for x-axis instead of time
         measurement_numbers = np.arange(1, len(values) + 1)
         
-        # Update line data
-        self.line_thickness.set_data(measurement_numbers, values)
-        self.line_median1.set_data(measurement_numbers, median_values)
         flags = np.array(self.thickness_rejected_flags, dtype=bool)
+        thickness_plot = values.copy()
+        median_plot = median_values.copy()
+        thickness_plot[flags] = np.nan
+        median_plot[flags] = np.nan
+
+        # Update line data (hide rejected points on main series; show as red markers)
+        self.line_thickness.set_data(measurement_numbers, thickness_plot)
+        self.line_median1.set_data(measurement_numbers, median_plot)
         rejected_x = measurement_numbers[flags]
-        rejected_y = values[flags]
+        rejected_y = np.where(np.isnan(median_values[flags]), values[flags], median_values[flags])
         self.line_thickness_rejected.set_data(rejected_x, rejected_y)
         
         # Auto-scale axes

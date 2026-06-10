@@ -118,7 +118,7 @@ class CHRocodileGUI:
         
         ttk.Label(conn_frame, text="IP Address:").grid(row=0, column=0, padx=(0, 5))
         self.ip_entry = ttk.Entry(conn_frame, width=15)
-        self.ip_entry.insert(0, "192.168.170.2")
+        self.ip_entry.insert(0, "132.31.40.111")
         self.ip_entry.grid(row=0, column=1, padx=(0, 5))
         
         self.config_ip_btn = ttk.Button(conn_frame, text="Configure Device IP", 
@@ -455,6 +455,31 @@ class CHRocodileGUI:
             threshold = 0.0
         return max(0.0, threshold)
 
+    def _effective_quality_threshold(self) -> float:
+        """Return the active quality threshold (entry field overrides stored value)."""
+        try:
+            return max(0.0, float(self.quality_threshold_var.get()))
+        except (ValueError, AttributeError, tk.TclError):
+            return max(0.0, float(self.quality_threshold))
+
+    def _is_below_quality_threshold(self, quality: Optional[float]) -> bool:
+        """
+        Return True when quality filtering is enabled and quality is below threshold.
+
+        Threshold <= 0 disables filtering (per EtherCAT guide). Quality must be a
+        finite number in the same units shown on the quality label.
+        """
+        threshold = self._effective_quality_threshold()
+        if threshold <= 0.0 or quality is None:
+            return False
+        try:
+            q = float(quality)
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(q):
+            return False
+        return q < threshold
+
     def _load_plc_thickness_source_setting(self) -> str:
         """Load persisted PLC thickness source setting."""
         source = self.settings_manager.get('device.plc_thickness_source', 'Thickness')
@@ -512,23 +537,16 @@ class CHRocodileGUI:
                 self.beckhoff_ads_interface.write_measurement_result(plc_error_data)
             return
         
-        # Update display
         thickness = data.get('thickness')
         median1 = data.get('median1')
-        if thickness is not None:
-            self.thickness_label.config(text=f"{thickness:.2f} μm")
-        else:
-            self.thickness_label.config(text="-- μm")
-        if median1 is not None:
-            self.median1_label.config(text=f"{median1:.2f} μm")
-        else:
-            self.median1_label.config(text="-- μm")
-        
         peak1 = data.get('peak1')
         peak2 = data.get('peak2')
         intensity = data.get('intensity')
         quality = data.get('quality')
         signal_snapshot = data.get('signal_snapshot')
+        below_quality_threshold = self._is_below_quality_threshold(quality)
+        invalid_fg = "red"
+        valid_fg = "black"
 
         # Update spectrum plot if spectrum data is available
         spectrum = data.get('spectrum')
@@ -559,14 +577,36 @@ class CHRocodileGUI:
 
         if quality is not None:
             self.quality_label.config(text=f"{float(quality):.3f}")
+            self.quality_label.config(
+                foreground=invalid_fg if below_quality_threshold else valid_fg
+            )
         else:
-            self.quality_label.config(text="--")
+            self.quality_label.config(text="--", foreground=valid_fg)
+
+        if thickness is not None:
+            thickness_text = f"{thickness:.2f} μm"
+            if below_quality_threshold:
+                thickness_text += " (invalid)"
+            self.thickness_label.config(text=thickness_text)
+            self.thickness_label.config(
+                foreground=invalid_fg if below_quality_threshold else valid_fg
+            )
+        else:
+            self.thickness_label.config(text="-- μm", foreground=valid_fg)
+
+        if median1 is not None:
+            median_text = f"{median1:.2f} μm"
+            if below_quality_threshold:
+                median_text += " (invalid)"
+            self.median1_label.config(text=median_text)
+            self.median1_label.config(
+                foreground=invalid_fg if below_quality_threshold else valid_fg
+            )
+        else:
+            self.median1_label.config(text="-- μm", foreground=valid_fg)
 
         # Update thickness plot
         timestamp = data.get('timestamp', time.time())
-        below_quality_threshold = (
-            quality is not None and float(quality) < float(self.quality_threshold)
-        )
         if thickness is not None or median1 is not None:
             self.plotter.update_thickness_plot(
                 timestamp,
@@ -583,8 +623,9 @@ class CHRocodileGUI:
         if self.debug_print_signals_var.get() and signal_snapshot:
             print(
                 f"[CHR DEBUG] Measurement #{self.measurement_count} "
-                f"signals={signal_snapshot.get('signal_ids')} "
+                f"active_sodx={signal_snapshot.get('signal_ids')} "
                 f"values={signal_snapshot.get('signals')} "
+                f"layout={signal_snapshot.get('layout')} "
                 f"intensity_sig={data.get('intensity_signal_id')} "
                 f"quality_sig={data.get('quality_signal_id')}"
             )
@@ -1222,7 +1263,8 @@ class CHRocodileGUI:
         self.settings_manager.save()
         self._log_status(
             f"Quality threshold set to {self.quality_threshold:.3f} "
-            f"(values below this send thickness=0 to Beckhoff)"
+            f"(0 = disabled; use same units as Quality display; "
+            f"below threshold: red median markers + thickness=0 to Beckhoff)"
         )
 
     def on_plc_thickness_source_change(self, event=None):

@@ -55,17 +55,16 @@ class CHRocodileController:
     Handles connection, measurement setup, and data acquisition.
     """
     
-    # Signal IDs for thickness measurement
-    SIGNAL_SAMPLE_COUNTER = 83  # Sample counter (global signal, optional)
-    SIGNAL_THICKNESS = 256      # Thickness 1 in float format (interferometric mode)
-    SIGNAL_MEDIAN1 = 260        # Median 1 measurement value (configured in device)
-    SIGNAL_INTENSITY_PERCENT = 76  # Not used for intensity in current CHR2 setup
-    SIGNAL_INTENSITY = 257      # Often intensity in confocal/single-peak mode; may differ by mode
-    SIGNAL_PEAK1_VALUE = 16640  # Peak 1 value (commonly used in confocal examples)
-    SIGNAL_PEAK1_QI = 16641     # Peak 1 quality/intensity (device/mode dependent)
-    SIGNAL_ALT_QUALITY = 16648  # Additional quality/intensity-like signal on some setups
-    # Note: For interferometric mode, signal 256 already includes refractive index correction
-    # Peak signals 16640/16641 are for confocal mode, not needed for interferometric thickness
+    # Interferometric CHRocodile 2 peak/global signals (float format, already in engineering units)
+    SIGNAL_SAMPLE_COUNTER = 83   # Sample counter (global)
+    SIGNAL_THICKNESS = 256       # Thickness 1 float (µm, geometrical)
+    SIGNAL_QUALITY = 257         # Quality 1 float (FFT peak quality in interferometric mode)
+    SIGNAL_MEDIAN1 = 260         # Median 1 float (µm; PeakValue + 4 per MED command)
+    SIGNAL_INTENSITY = 82        # InterferomIntensity global (% of full well)
+    # Legacy int16 peak signals (confocal / compatibility fallbacks only)
+    SIGNAL_PEAK1_VALUE = 16640
+    SIGNAL_PEAK1_QI = 16641
+    SIGNAL_ALT_QUALITY = 16648
     
     def __init__(self, data_callback: Optional[Callable] = None):
         """
@@ -94,6 +93,208 @@ class CHRocodileController:
         self.include_spectrum_in_continuous = False  # Whether to download spectrum in continuous mode
         self._measurement_lock = threading.Lock()  # Serializes get_next_samples calls across threads
         self._stream_started = False  # True once start_data_stream() succeeds
+        self._active_output_signals = []  # Signal IDs confirmed by device after SODX
+        self._last_sample_counter = None  # Detect stale / repeated buffer reads
+        self._buffer_backlog_warn_ts = 0.0  # Rate-limit backlog console messages
+
+    def _data_single_sample(self, data, sample_no: int = 0):
+        """Return a Data object containing only one sample row."""
+        if data is None or data.sample_cnt <= 1:
+            return data
+        idx = min(max(sample_no, 0), data.sample_cnt - 1)
+        return Data(
+            data.samples[idx:idx + 1],
+            1,
+            data.gen_signal_info,
+            data.signal_info,
+            data.error_code,
+            data._dll_h,
+        )
+
+    def _maybe_log_buffer_backlog(self, drained: int, sample_counter: Optional[int]):
+        """Log buffer backlog occasionally (normal when device rate exceeds poll rate)."""
+        if drained <= 20:
+            return
+        now = time.time()
+        if now - self._buffer_backlog_warn_ts < 60.0:
+            return
+        self._buffer_backlog_warn_ts = now
+        print(
+            f"[BUFFER] Discarded {drained} queued sample(s) to use latest "
+            f"(counter={sample_counter}). Normal if device rate is higher than GUI poll rate."
+        )
+
+    def _read_sample_counter(self, data) -> Optional[int]:
+        """Read global sample counter (signal 83) when present in the stream."""
+        value = self._extract_first_signal(data, self.SIGNAL_SAMPLE_COUNTER)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+    def _drain_stream_to_latest(self, batch_size: int = 256, max_batches: int = 8) -> Tuple[Optional[object], int]:
+        """
+        Drain the chrpy receive FIFO and return the newest sample.
+
+        Uses batch reads (one DLL call per chunk) instead of one call per sample.
+        """
+        if not self.connection:
+            return None, 0
+
+        latest_data = None
+        latest_idx = 0
+        drained = 0
+
+        for _ in range(max_batches):
+            try:
+                data = self.connection.get_next_samples(batch_size, False)
+            except APIException as exc:
+                err_str = str(exc)
+                if '-536580864' in err_str:
+                    print("[STREAM] Sample stream out of sync — flushing buffer")
+                    self._flush_stream_buffer()
+                    continue
+                raise
+
+            if data is None or data.sample_cnt == 0:
+                break
+
+            drained += data.sample_cnt
+            latest_data = data
+            latest_idx = data.sample_cnt - 1
+
+            if data.sample_cnt < batch_size:
+                break
+
+        if latest_data is None:
+            return None, 0
+
+        return self._data_single_sample(latest_data, latest_idx), drained
+
+    def _query_output_signals(self) -> list:
+        """Return the active SODX signal list reported by the device."""
+        if not self.connection:
+            return []
+        try:
+            resp = self.connection.query(CmdId.OUTPUT_SIGNALS)
+            if resp and resp.error_code == 0 and resp.args:
+                return [int(x) for x in resp.args]
+        except Exception:
+            pass
+        try:
+            resp = self.connection.exec_from_string('SODX ?')
+            if resp and resp.error_code == 0 and resp.args:
+                return [int(x) for x in resp.args]
+        except Exception:
+            pass
+        return []
+
+    def _flush_stream_buffer(self):
+        """Discard stale samples after the output signal layout changes."""
+        if not self.connection:
+            return
+        try:
+            self.connection.flush_connection_buffer()
+        except Exception as ex:
+            print(f"[STREAM] flush_connection_buffer: {ex}")
+
+    def _resync_data_stream(self):
+        """Restart streaming and flush stale samples after SODX changes."""
+        if not self.connection:
+            return
+        try:
+            self.connection.stop_data_stream()
+        except Exception:
+            pass
+        self._stream_started = False
+        time.sleep(0.05)
+        self._flush_stream_buffer()
+        try:
+            self.connection.start_data_stream()
+            self._stream_started = True
+        except Exception as ex:
+            print(f"[STREAM] start_data_stream after resync FAILED: {ex}")
+            self._stream_started = False
+            return
+        # Drop every queued packet so the next read is fresh (not pre-SODX layout).
+        _, drained = self._drain_stream_to_latest()
+        if drained:
+            print(f"[STREAM] Drained {drained} stale sample(s) after resync")
+        self._last_sample_counter = None
+
+    def _signal_is_active(self, signal_id: int) -> bool:
+        return (not self._active_output_signals) or (signal_id in self._active_output_signals)
+
+    def _extract_first_signal(self, data, signal_id: int) -> Optional[float]:
+        """
+        Read a signal value from the current sample.
+
+        Float signals (256/257/260/82) are already in engineering units in the
+        chrpy DOUBLE buffer — no manual scaling.
+        """
+        if not self._signal_is_active(signal_id):
+            return None
+        try:
+            values = data.get_signal_values(signal_id, 0)
+        except Exception:
+            return None
+
+        if values is None:
+            return None
+        if isinstance(values, (float, int, np.floating, np.integer)):
+            value = float(values)
+            return None if np.isnan(value) else value
+        try:
+            if len(values) == 0:
+                return None
+            value = float(values[0])
+            return None if np.isnan(value) else value
+        except Exception:
+            return None
+
+    def _describe_sample_layout(self, data) -> dict:
+        """Describe how the current sample row maps to signal IDs (for debugging)."""
+        layout = {
+            "signal_info": [],
+            "raw_row": None,
+        }
+        for idx, sig in enumerate(data.signal_info or []):
+            try:
+                sig_id = int(sig[1])
+            except Exception:
+                continue
+            entry = {"idx": idx, "signal_id": sig_id}
+            try:
+                entry["value"] = self._format_signal_value_for_debug(
+                    data.get_signal_values(sig_id, 0)
+                )
+            except Exception as exc:
+                entry["error"] = str(exc)
+            layout["signal_info"].append(entry)
+
+        try:
+            if data.samples is not None and data.sample_cnt > 0:
+                row = data.samples[0]
+                if isinstance(row, np.ndarray):
+                    layout["raw_row"] = [
+                        None if (isinstance(v, float) and np.isnan(v)) else float(v)
+                        for v in row.tolist()
+                    ]
+        except Exception:
+            pass
+
+        try:
+            if data.gen_signal_info is not None:
+                layout["meta"] = {
+                    "channel_cnt": int(getattr(data.gen_signal_info, "channel_cnt", 0)),
+                    "global_sig_cnt": int(getattr(data.gen_signal_info, "global_sig_cnt", 0)),
+                    "peak_sig_cnt": int(getattr(data.gen_signal_info, "peak_sig_cnt", 0)),
+                }
+        except Exception:
+            pass
+        return layout
 
     def _format_signal_value_for_debug(self, value):
         """Convert a signal value to a debug-friendly Python type."""
@@ -128,6 +329,7 @@ class CHRocodileController:
         snapshot = {
             "signal_ids": [],
             "signals": {},
+            "layout": self._describe_sample_layout(data),
         }
         try:
             if data.gen_signal_info is not None:
@@ -188,27 +390,25 @@ class CHRocodileController:
             # Open the connection
             self.connection.open()
 
-            # Stop any stream left active from a previous session.
-            # If the device is still streaming, the first command will fail with
-            # "Device data format packet is missing" (-536450304).
+            print("[CONNECT] Stopping any existing stream ...")
             try:
                 self.connection.stop_data_stream()
-            except Exception:
-                pass
-            # Brief pause so the device processes the stop before we send setup commands.
+                print("[CONNECT] Stream stopped OK")
+            except Exception as ex:
+                print(f"[CONNECT] Stream stop (pre-connect): {ex} (ignored)")
             time.sleep(0.1)
 
-            # Setup measurement signals
+            print("[CONNECT] Running _setup_measurement ...")
             self._setup_measurement()
+            print("[CONNECT] _setup_measurement done")
 
-            # Pre-start the stream so it is ready before the first measurement.
-            # Doing this once here avoids racing start_data_stream() calls from
-            # multiple threads later.
-            try:
-                self.connection.start_data_stream()
-                self._stream_started = True
-            except Exception:
-                self._stream_started = False
+            print("[CONNECT] Starting data stream ...")
+            self._resync_data_stream()
+            if self._stream_started:
+                print("[CONNECT] Data stream started OK")
+                print(f"[CONNECT] Active SODX signals: {self._active_output_signals}")
+            else:
+                print("[CONNECT] Data stream start FAILED")
 
             self.state = ConnectionState.CONNECTED
             return True, "Connected successfully"
@@ -253,12 +453,11 @@ class CHRocodileController:
             return False, f"Disconnect error: {str(e)}"
     
     def _setup_measurement(self):
-        """Configure the device for thickness measurement."""
+        """Configure this client's output signal list (SODX). Device MMD/NOP/AVD are left as-is."""
         if not self.connection:
             return
-        
+
         def _exec_checked(cmd: str, *args):
-            """Execute device command and raise a clear error on failure."""
             try:
                 resp = self.connection.exec(cmd, *args)
             except Exception as e:
@@ -267,56 +466,66 @@ class CHRocodileController:
                 raise Exception(f"{cmd}{args}: device error_code={resp.error_code}")
             return resp
 
-        try:
-            # Set measuring mode FIRST (interferometric for thickness)
-            # This must be set before configuring signals
-            _exec_checked('MMD', self.measuring_mode)
-            
-            # Set number of peaks to 2 (for film thickness measurement)
-            _exec_checked('NOP', 2)
-            
-            # Set output signals with compatibility fallbacks.
-            # Signal 256 = Thickness 1 in float format (already includes refractive index correction)
-            # 16641/16648 may provide quality/intensity-like values on some setups.
-            # We keep 257 as additional candidate for intensity.
+        def _exec_verbose(cmd: str, *args):
+            """Run command and print result to terminal."""
+            args_str = ', '.join(str(a) for a in args)
             try:
-                _exec_checked(
-                    'SODX',
+                resp = _exec_checked(cmd, *args)
+                print(f"[SETUP] {cmd}({args_str}) -> OK  (resp args={getattr(resp, 'args', None)})")
+                return resp
+            except Exception as e:
+                print(f"[SETUP] {cmd}({args_str}) -> FAILED: {e}")
+                raise
+
+        try:
+            before = self._query_output_signals()
+            if before:
+                print(f"[SETUP] Device SODX before connect setup: {before}")
+
+            # Globals first, then peak signals — matches chrpy DOUBLE buffer layout.
+            # 256=Thickness1, 257=Quality1, 260=Median1 (interferometric float).
+            sodx_candidates = [
+                [
+                    self.SIGNAL_SAMPLE_COUNTER,
+                    self.SIGNAL_INTENSITY,
+                    self.SIGNAL_THICKNESS,
+                    self.SIGNAL_QUALITY,
+                    self.SIGNAL_MEDIAN1,
+                ],
+                [
                     self.SIGNAL_SAMPLE_COUNTER,
                     self.SIGNAL_THICKNESS,
+                    self.SIGNAL_QUALITY,
                     self.SIGNAL_MEDIAN1,
-                    self.SIGNAL_PEAK1_QI,
-                    self.SIGNAL_ALT_QUALITY,
-                    self.SIGNAL_INTENSITY
-                )
-            except Exception:
+                ],
+                [
+                    self.SIGNAL_THICKNESS,
+                    self.SIGNAL_QUALITY,
+                    self.SIGNAL_MEDIAN1,
+                ],
+                [self.SIGNAL_THICKNESS, self.SIGNAL_QUALITY],
+                [self.SIGNAL_THICKNESS],
+            ]
+
+            sodx_signals = None
+            last_error = None
+            for candidate in sodx_candidates:
                 try:
-                    _exec_checked(
-                        'SODX',
-                        self.SIGNAL_SAMPLE_COUNTER,
-                        self.SIGNAL_THICKNESS,
-                        self.SIGNAL_MEDIAN1,
-                        self.SIGNAL_PEAK1_QI,
-                        self.SIGNAL_ALT_QUALITY,
-                        self.SIGNAL_INTENSITY
-                    )
-                except Exception:
-                    try:
-                        _exec_checked(
-                            'SODX',
-                            self.SIGNAL_SAMPLE_COUNTER,
-                            self.SIGNAL_PEAK1_VALUE,
-                            self.SIGNAL_PEAK1_QI,
-                            self.SIGNAL_MEDIAN1
-                        )
-                    except Exception:
-                        try:
-                            _exec_checked('SODX', self.SIGNAL_THICKNESS, self.SIGNAL_MEDIAN1, self.SIGNAL_INTENSITY)
-                        except Exception:
-                            _exec_checked('SODX', self.SIGNAL_THICKNESS)
-            # Do not force-write SHZ/AVD/AVS/LIA/SRI on connect.
-            # Users requested to keep device settings as-is and read them first.
-            
+                    _exec_verbose('SODX', *candidate)
+                    sodx_signals = candidate
+                    print(f"[SETUP] SODX active signals: {sodx_signals}")
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    print(f"[SETUP] SODX fallback failed for {candidate}: {exc}")
+
+            if sodx_signals is None:
+                raise Exception(f"Failed to configure SODX: {last_error}")
+
+            confirmed = self._query_output_signals()
+            self._active_output_signals = confirmed or list(sodx_signals)
+            print(f"[SETUP] Device confirmed SODX: {self._active_output_signals}")
+
         except Exception as e:
             raise Exception(f"Failed to setup measurement: {str(e)}")
     
@@ -442,10 +651,11 @@ class CHRocodileController:
             timeout_s = min(5.0, max(0.5, estimated_period_s * 8.0))
 
             data = None
+            drained_total = 0
             start_wait = time.time()
             while (time.time() - start_wait) < timeout_s:
-                # Non-blocking fetch from current stream buffer.
-                data = self.connection.get_next_samples(1, False)
+                data, drained = self._drain_stream_to_latest()
+                drained_total += drained
                 if data is not None and data.sample_cnt > 0:
                     break
                 time.sleep(0.01)
@@ -455,81 +665,37 @@ class CHRocodileController:
             
             if data.error_code < 0:
                 return {'error': f'Device error: {data.error_code}'}
+
+            sample_counter = self._read_sample_counter(data)
+            counter_stale = (
+                sample_counter is not None
+                and self._last_sample_counter is not None
+                and sample_counter <= self._last_sample_counter
+            )
+            if drained_total > 20:
+                self._maybe_log_buffer_backlog(drained_total, sample_counter)
+            if counter_stale:
+                print(
+                    f"[BUFFER] Sample counter did not advance "
+                    f"({self._last_sample_counter} -> {sample_counter}); flushing"
+                )
+                self._flush_stream_buffer()
+                retry, retry_drained = self._drain_stream_to_latest()
+                drained_total += retry_drained
+                if retry is not None:
+                    data = retry
+                    sample_counter = self._read_sample_counter(data)
+            if sample_counter is not None:
+                self._last_sample_counter = sample_counter
             
-            def _extract_first_signal(signal_id: int) -> Optional[float]:
-                """
-                Robustly read a signal value from current sample.
-                Handles scalar and array-like return variants.
-                """
-                try:
-                    values = data.get_signal_values(signal_id, 0)
-                except Exception:
-                    return None
+            # Float signals are already in µm / quality units via chrpy DOUBLE buffer.
+            thickness = self._extract_first_signal(data, self.SIGNAL_THICKNESS)
+            quality = self._extract_first_signal(data, self.SIGNAL_QUALITY)
+            median1 = self._extract_first_signal(data, self.SIGNAL_MEDIAN1)
+            intensity = self._extract_first_signal(data, self.SIGNAL_INTENSITY)
 
-                if values is None:
-                    return None
-                if isinstance(values, (float, int, np.floating)):
-                    value = float(values)
-                    if np.isnan(value):
-                        return None
-                    return value
-                try:
-                    if len(values) == 0:
-                        return None
-                    value = float(values[0])
-                    if np.isnan(value):
-                        return None
-                    return value
-                except Exception:
-                    return None
-
-            # Extract thickness (signal 256)
-            # Signal 256 in float format already includes refractive index correction
-            # Value is already geometrical thickness in micrometers - NO manual correction needed!
-            thickness = _extract_first_signal(self.SIGNAL_THICKNESS)
-            median1 = _extract_first_signal(self.SIGNAL_MEDIAN1)
-            available_ids = set()
-            try:
-                if data.signal_info:
-                    available_ids = {int(sig[1]) for sig in data.signal_info if len(sig) > 1}
-            except Exception:
-                available_ids = set()
-
-            def _extract_from_candidates(candidates, excluded_ids=None):
-                excluded_ids = excluded_ids or set()
-                for sig_id in candidates:
-                    if sig_id in excluded_ids:
-                        continue
-                    if sig_id in available_ids:
-                        value = _extract_first_signal(sig_id)
-                        if value is not None:
-                            return value, sig_id
-                return None, None
-
-            def _normalize_intensity(raw_value: Optional[float], sig_id: Optional[int]) -> Optional[float]:
-                """
-                Normalize intensity to a human-friendly percent-like value.
-                CHR signals such as 16648/16641 are often fixed-point with scale 1/16.
-                """
-                if raw_value is None or sig_id is None:
-                    return raw_value
-                if sig_id in (self.SIGNAL_ALT_QUALITY, self.SIGNAL_PEAK1_QI):
-                    # Apply fixed-point conversion when clearly out of percent range.
-                    if raw_value > 100.0:
-                        return raw_value / 16.0
-                return raw_value
-
-            # Keep intensity and quality strictly separate to avoid duplicated values.
-            # Observed CHR2 behavior: quality aligns with 257/16641 raw values,
-            # while 16648 behaves like intensity-like fixed-point value.
-            intensity, intensity_sig = _extract_from_candidates(
-                [self.SIGNAL_ALT_QUALITY, self.SIGNAL_PEAK1_QI]
-            )
-            intensity = _normalize_intensity(intensity, intensity_sig)
-            quality, _quality_sig = _extract_from_candidates(
-                [self.SIGNAL_INTENSITY, self.SIGNAL_PEAK1_QI, 258],
-                excluded_ids={intensity_sig} if intensity_sig is not None else set()
-            )
+            _quality_sig = self.SIGNAL_QUALITY if quality is not None else None
+            intensity_sig = self.SIGNAL_INTENSITY if intensity is not None else None
             
             # For interferometric mode, peak signals are not the same as confocal mode
             # We can try to get peak positions from spectrum if needed, but for now
@@ -547,6 +713,8 @@ class CHRocodileController:
                 'peak2': peak2,
                 'intensity_signal_id': intensity_sig,
                 'quality_signal_id': _quality_sig,
+                'sample_counter': sample_counter,
+                'buffer_drained': drained_total,
                 'signal_snapshot': self._collect_signal_snapshot(data),
                 'timestamp': time.time()
             }
@@ -573,17 +741,13 @@ class CHRocodileController:
 
     def _recover_data_stream(self):
         """Stop and restart the data stream after an internal thread error."""
-        self._stream_started = False
-        try:
-            self.connection.stop_data_stream()
-        except Exception:
-            pass
-        time.sleep(0.1)
-        try:
-            self.connection.start_data_stream()
-            self._stream_started = True
-        except Exception:
-            pass
+        print("[RECOVER] Internal stream error — resyncing stream ...")
+        time.sleep(2.0)
+        self._resync_data_stream()
+        if self._stream_started:
+            print("[RECOVER] Stream restarted OK")
+        else:
+            print("[RECOVER] Stream restart FAILED")
 
     def start_continuous_measurement(self, interval_ms: int = 100, include_spectrum: bool = False):
         """
@@ -601,13 +765,20 @@ class CHRocodileController:
         self.stop_event.clear()
         self.include_spectrum_in_continuous = include_spectrum
         
-        # Start data stream (only once, keep it running)
-        success, msg = self.start_data_stream()
-        if not success:
-            self.continuous_measurement_active = False
-            return
-        
-        # Start measurement thread
+        # Start data stream if not already running from connect().
+        if not self._stream_started:
+            print("[CONT] Stream not yet started — resyncing now ...")
+            self._resync_data_stream()
+            if self._stream_started:
+                print("[CONT] Stream started")
+            else:
+                print("[CONT] Stream start FAILED — aborting continuous measurement")
+                self.continuous_measurement_active = False
+                return
+        else:
+            print("[CONT] Stream already running — reusing existing stream")
+
+        print(f"[CONT] Starting measurement loop (interval={interval_ms}ms)")
         self.measurement_thread = threading.Thread(
             target=self._continuous_measurement_loop,
             daemon=True
@@ -629,46 +800,55 @@ class CHRocodileController:
         """Internal loop for continuous measurements."""
         consecutive_errors = 0
         max_consecutive_errors = 5
-        
+        measurement_count = 0
+
         while self.continuous_measurement_active and not self.stop_event.is_set():
             try:
-                # Get measurement (with spectrum if requested)
                 measurement = self.get_single_measurement(include_spectrum=self.include_spectrum_in_continuous)
-                
+
                 if measurement and 'error' not in measurement:
-                    # Reset error counter on success
                     consecutive_errors = 0
-                    
-                    # Put measurement in queue for GUI thread
+                    measurement_count += 1
+
+                    # Print first 10 measurements and then every 500 to terminal
+                    if measurement_count <= 10 or measurement_count % 500 == 0:
+                        snap = measurement.get('signal_snapshot', {})
+                        print(
+                            f"[MEAS #{measurement_count}] "
+                            f"thickness={measurement.get('thickness')} "
+                            f"median1={measurement.get('median1')} "
+                            f"quality={measurement.get('quality')} "
+                            f"intensity={measurement.get('intensity')} "
+                            f"counter={measurement.get('sample_counter')} "
+                            f"drained={measurement.get('buffer_drained')} "
+                            f"active_sodx={self._active_output_signals}"
+                        )
+
                     self.data_queue.put(measurement)
-                    
-                    # Call callback if provided
+
                     if self.data_callback:
                         try:
                             self.data_callback(measurement)
                         except Exception as e:
-                            print(f"Error in data callback: {e}")
+                            print(f"[MEAS] Callback error: {e}")
                 else:
-                    # Handle error
                     consecutive_errors += 1
                     if measurement:
                         error_msg = measurement.get('error', 'Unknown error')
-                        print(f"Measurement error: {error_msg}")
-                    
-                    # If too many consecutive errors, stop continuous measurement
+                        print(f"[MEAS] Error: {error_msg}")
+
                     if consecutive_errors >= max_consecutive_errors:
-                        print(f"Too many consecutive errors ({consecutive_errors}), stopping continuous measurement")
+                        print(f"[MEAS] {consecutive_errors} consecutive errors — stopping loop")
                         self.continuous_measurement_active = False
                         break
-                
+
             except Exception as e:
-                print(f"Exception in continuous measurement loop: {e}")
+                print(f"[MEAS] Exception in loop: {e}")
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
                     self.continuous_measurement_active = False
                     break
-            
-            # Wait for next measurement interval
+
             self.stop_event.wait(self.measurement_interval_ms / 1000.0)
     
     def download_spectrum(self) -> Optional[dict]:
