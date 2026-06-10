@@ -4,6 +4,7 @@ Clean Beckhoff ADS Interface using pyads
 Stable, minimal, production-ready implementation
 """
 
+import ctypes
 import os
 import sys
 import time
@@ -134,6 +135,10 @@ class BeckhoffADSInterface:
         self._poll_count = 0
         self._last_poll_time: Optional[float] = None
 
+        # TwinCAT STRING(n) size — must match the PLC symbol declaration.
+        # Default STRING in TwinCAT is STRING(80) = 81 bytes (80 chars + null).
+        self.string_max_length: int = 80
+
     # -----------------------------------------------------
     # Logging helper
     # -----------------------------------------------------
@@ -240,6 +245,17 @@ class BeckhoffADSInterface:
         if not self.plc or not self.plc.is_open:
             raise RuntimeError("PLC not connected")
         return self.plc.read_by_name(name, plc_type)
+
+    def _write_string(self, name: str, value: str) -> bool:
+        """Write a STRING PLC variable using the declared string length.
+
+        pyads.PLCTYPE_STRING always sends 1025 bytes (its internal buffer), but
+        TwinCAT's STRING(n) expects exactly n+1 bytes.  We build the matching
+        ctypes type here so the ADS layer never sees a size mismatch (error 1797).
+        """
+        truncated = str(value)[:self.string_max_length]
+        string_type = ctypes.c_char * (self.string_max_length + 1)
+        return self._write(name, truncated, string_type)
 
     def _write(self, name: str, value, plc_type) -> bool:
         """Write PLC variable with timeout."""
@@ -422,7 +438,7 @@ class BeckhoffADSInterface:
 
         except Exception as e:
             self._log("error", f"Trigger error: {e}")
-            self._write(self.var_error, str(e)[:255], pyads.PLCTYPE_STRING)
+            self._write_string(self.var_error, str(e))
             self._write(self.var_busy, False, pyads.PLCTYPE_BOOL)
             self._measurement_in_progress = False
 
@@ -456,10 +472,15 @@ class BeckhoffADSInterface:
             count = measurement_data.get('measurement_count', 0)
             self._write(self.var_count, int(count), pyads.PLCTYPE_UDINT)
 
+            error_text = measurement_data.get('error')
+
             # Handshake
             self._write(self.var_busy, False, pyads.PLCTYPE_BOOL)
             self._write(self.var_ready, True, pyads.PLCTYPE_BOOL)
-            self._write(self.var_error, '', pyads.PLCTYPE_STRING)
+            if error_text:
+                self._write_string(self.var_error, str(error_text))
+            else:
+                self._write_string(self.var_error, '')
 
             self._measurement_in_progress = False
             self._log("handshake", "Measurement complete")
@@ -468,6 +489,34 @@ class BeckhoffADSInterface:
             self._log("error", f"Write result error: {e}")
             self._write(self.var_busy, False, pyads.PLCTYPE_BOOL)
             self._measurement_in_progress = False
+
+    def reset_handshake_state(self):
+        """
+        Reset ADS handshake variables to a known idle state.
+
+        Useful after applying device settings that may transiently disrupt
+        measurement timing/flow and leave PLC/application handshake out of sync.
+        """
+        if not self.plc or not self.plc.is_open:
+            return False
+
+        try:
+            self._measurement_in_progress = False
+            self._write(self.var_busy, False, pyads.PLCTYPE_BOOL)
+            self._write(self.var_ready, False, pyads.PLCTYPE_BOOL)
+            self._write_string(self.var_error, '')
+
+            # Re-sync trigger edge detector to current PLC trigger state
+            try:
+                self._last_trigger_state = self._read(self.var_trigger, pyads.PLCTYPE_BOOL)
+            except Exception:
+                self._last_trigger_state = False
+
+            self._log("handshake", "Handshake state reset after settings change")
+            return True
+        except Exception as e:
+            self._log("error", f"Handshake reset failed: {e}")
+            return False
 
     # -----------------------------------------------------
     # Reconnect Logic

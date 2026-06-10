@@ -6,6 +6,8 @@ Handles connection, measurement, and data acquisition from the device.
 
 import sys
 import os
+import io
+import contextlib
 import threading
 import time
 import queue
@@ -56,6 +58,12 @@ class CHRocodileController:
     # Signal IDs for thickness measurement
     SIGNAL_SAMPLE_COUNTER = 83  # Sample counter (global signal, optional)
     SIGNAL_THICKNESS = 256      # Thickness 1 in float format (interferometric mode)
+    SIGNAL_MEDIAN1 = 260        # Median 1 measurement value (configured in device)
+    SIGNAL_INTENSITY_PERCENT = 76  # Not used for intensity in current CHR2 setup
+    SIGNAL_INTENSITY = 257      # Often intensity in confocal/single-peak mode; may differ by mode
+    SIGNAL_PEAK1_VALUE = 16640  # Peak 1 value (commonly used in confocal examples)
+    SIGNAL_PEAK1_QI = 16641     # Peak 1 quality/intensity (device/mode dependent)
+    SIGNAL_ALT_QUALITY = 16648  # Additional quality/intensity-like signal on some setups
     # Note: For interferometric mode, signal 256 already includes refractive index correction
     # Peak signals 16640/16641 are for confocal mode, not needed for interferometric thickness
     
@@ -82,7 +90,72 @@ class CHRocodileController:
         self.spectrum_average = 1  # Default spectrum averaging
         self.measuring_mode = 1  # 0=confocal, 1=interferometric
         self.lamp_intensity = 50  # Default lamp intensity (0-100)
+        self.lamp_control_supported = None  # Unknown until confirmed by query/set
         self.include_spectrum_in_continuous = False  # Whether to download spectrum in continuous mode
+        self._measurement_lock = threading.Lock()  # Serializes get_next_samples calls across threads
+        self._stream_started = False  # True once start_data_stream() succeeds
+
+    def _format_signal_value_for_debug(self, value):
+        """Convert a signal value to a debug-friendly Python type."""
+        if value is None:
+            return None
+
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return []
+            if value.size == 1:
+                scalar = float(value.item())
+                return None if np.isnan(scalar) else scalar
+            # Prevent huge terminal spam for multi-channel arrays.
+            preview_len = min(12, int(value.size))
+            preview = value[:preview_len].tolist()
+            return {
+                "len": int(value.size),
+                "preview": preview,
+                "truncated": bool(value.size > preview_len),
+            }
+
+        if isinstance(value, (float, int, np.floating, np.integer)):
+            scalar = float(value)
+            return None if np.isnan(scalar) else scalar
+
+        return str(value)
+
+    def _collect_signal_snapshot(self, data) -> dict:
+        """
+        Collect all available streamed signal IDs and current values for debugging.
+        """
+        snapshot = {
+            "signal_ids": [],
+            "signals": {},
+        }
+        try:
+            if data.gen_signal_info is not None:
+                snapshot["meta"] = {
+                    "channel_cnt": int(getattr(data.gen_signal_info, "channel_cnt", 0)),
+                    "global_sig_cnt": int(getattr(data.gen_signal_info, "global_sig_cnt", 0)),
+                    "peak_sig_cnt": int(getattr(data.gen_signal_info, "peak_sig_cnt", 0)),
+                }
+        except Exception:
+            pass
+
+        seen = set()
+        for sig in (data.signal_info or []):
+            try:
+                sig_id = int(sig[1])
+            except Exception:
+                continue
+            if sig_id in seen:
+                continue
+            seen.add(sig_id)
+            snapshot["signal_ids"].append(sig_id)
+            try:
+                value = data.get_signal_values(sig_id, 0)
+                snapshot["signals"][str(sig_id)] = self._format_signal_value_for_debug(value)
+            except Exception as e:
+                snapshot["signals"][str(sig_id)] = {"error": str(e)}
+
+        return snapshot
         
     def connect(self, ip_address: str) -> Tuple[bool, str]:
         """
@@ -114,10 +187,29 @@ class CHRocodileController:
             
             # Open the connection
             self.connection.open()
-            
+
+            # Stop any stream left active from a previous session.
+            # If the device is still streaming, the first command will fail with
+            # "Device data format packet is missing" (-536450304).
+            try:
+                self.connection.stop_data_stream()
+            except Exception:
+                pass
+            # Brief pause so the device processes the stop before we send setup commands.
+            time.sleep(0.1)
+
             # Setup measurement signals
             self._setup_measurement()
-            
+
+            # Pre-start the stream so it is ready before the first measurement.
+            # Doing this once here avoids racing start_data_stream() calls from
+            # multiple threads later.
+            try:
+                self.connection.start_data_stream()
+                self._stream_started = True
+            except Exception:
+                self._stream_started = False
+
             self.state = ConnectionState.CONNECTED
             return True, "Connected successfully"
             
@@ -142,16 +234,16 @@ class CHRocodileController:
         
         try:
             if self.connection:
-                # Stop data stream if it was started
                 try:
                     self.connection.stop_data_stream()
                 except:
                     pass
-                
+                self._stream_started = False
+
                 # Close connection
                 self.connection.close()
                 self.connection = None
-            
+
             self.state = ConnectionState.DISCONNECTED
             return True, "Disconnected successfully"
             
@@ -183,37 +275,47 @@ class CHRocodileController:
             # Set number of peaks to 2 (for film thickness measurement)
             _exec_checked('NOP', 2)
             
-            # Set output signals: sample counter (optional) + thickness (256)
+            # Set output signals with compatibility fallbacks.
             # Signal 256 = Thickness 1 in float format (already includes refractive index correction)
-            # For interferometric mode, we use signal 256, not peak signals 16640/16641
-            # Some firmware variants reject mixed signal lists; fallback to thickness-only.
+            # 16641/16648 may provide quality/intensity-like values on some setups.
+            # We keep 257 as additional candidate for intensity.
             try:
-                _exec_checked('SODX', self.SIGNAL_SAMPLE_COUNTER, self.SIGNAL_THICKNESS)
+                _exec_checked(
+                    'SODX',
+                    self.SIGNAL_SAMPLE_COUNTER,
+                    self.SIGNAL_THICKNESS,
+                    self.SIGNAL_MEDIAN1,
+                    self.SIGNAL_PEAK1_QI,
+                    self.SIGNAL_ALT_QUALITY,
+                    self.SIGNAL_INTENSITY
+                )
             except Exception:
-                _exec_checked('SODX', self.SIGNAL_THICKNESS)
-            
-            # Set measuring rate
-            _exec_checked('SHZ', self.measuring_rate_hz)
-            
-            # Set averaging
-            _exec_checked('AVD', self.data_average)
-            
-            _exec_checked('AVS', self.spectrum_average)
-            
-            # Set lamp intensity.
-            # Some devices / firmware variants may reject this command or
-            # require different permissions. Treat this as a non-fatal issue
-            # so the rest of the measurement pipeline can still operate.
-            try:
-                _exec_checked('LIA', self.lamp_intensity)
-            except Exception as e:
-                # Log but do not abort setup if lamp configuration fails
-                print(f"Warning: failed to set lamp intensity with LIA({self.lamp_intensity,}): {e}")
-            
-            # Set refractive index if it's been changed from default
-            ok, msg = self.set_refractive_index(self.refractive_index)
-            if not ok:
-                raise Exception(msg)
+                try:
+                    _exec_checked(
+                        'SODX',
+                        self.SIGNAL_SAMPLE_COUNTER,
+                        self.SIGNAL_THICKNESS,
+                        self.SIGNAL_MEDIAN1,
+                        self.SIGNAL_PEAK1_QI,
+                        self.SIGNAL_ALT_QUALITY,
+                        self.SIGNAL_INTENSITY
+                    )
+                except Exception:
+                    try:
+                        _exec_checked(
+                            'SODX',
+                            self.SIGNAL_SAMPLE_COUNTER,
+                            self.SIGNAL_PEAK1_VALUE,
+                            self.SIGNAL_PEAK1_QI,
+                            self.SIGNAL_MEDIAN1
+                        )
+                    except Exception:
+                        try:
+                            _exec_checked('SODX', self.SIGNAL_THICKNESS, self.SIGNAL_MEDIAN1, self.SIGNAL_INTENSITY)
+                        except Exception:
+                            _exec_checked('SODX', self.SIGNAL_THICKNESS)
+            # Do not force-write SHZ/AVD/AVS/LIA/SRI on connect.
+            # Users requested to keep device settings as-is and read them first.
             
         except Exception as e:
             raise Exception(f"Failed to setup measurement: {str(e)}")
@@ -299,6 +401,9 @@ class CHRocodileController:
             Dictionary with measurement data or None if error:
             {
                 'thickness': float,  # Thickness in micrometers (already corrected for refractive index)
+                'median1': float,    # Median 1 value in micrometers (if configured)
+                'intensity': float,  # Measurement intensity (raw/device units)
+                'quality': float,    # Measurement quality (raw/device units)
                 'peak1': float,      # Peak 1 position (from spectrum, if available)
                 'peak2': float,      # Peak 2 position (from spectrum, if available)
                 'spectrum': np.ndarray (if include_spectrum=True),
@@ -314,32 +419,117 @@ class CHRocodileController:
         """
         if self.state != ConnectionState.CONNECTED:
             return {'error': 'Not connected'}
-        
+
+        # Prevent concurrent get_next_samples calls across threads (continuous loop +
+        # PLC-triggered single shot).  Non-blocking: if another measurement is already
+        # in flight, skip this one rather than queuing behind it.
+        if not self._measurement_lock.acquire(blocking=False):
+            return {'error': 'Measurement already in progress'}
+
         try:
-            # For single measurements (not in continuous mode), ensure data stream is running
-            if not self.continuous_measurement_active:
+            # Ensure stream is running (pre-started in connect(); only fall back to
+            # starting it here if that failed or it has since been stopped).
+            if not self._stream_started:
                 self.start_data_stream()
-            
-            # Get next sample (data stream should already be running for continuous mode)
-            data = self.connection.get_next_samples(1, False)
-            
+                self._stream_started = True
+
+            # With higher averaging (AVD/AVS), the first valid sample can take longer.
+            # Retry for a bounded time instead of failing immediately.
+            rate_hz = max(1, int(self.measuring_rate_hz))
+            avg_factor = max(1, int(self.data_average))
+            # Estimated sample period scales with averaging; add safety margin.
+            estimated_period_s = avg_factor / rate_hz
+            timeout_s = min(5.0, max(0.5, estimated_period_s * 8.0))
+
+            data = None
+            start_wait = time.time()
+            while (time.time() - start_wait) < timeout_s:
+                # Non-blocking fetch from current stream buffer.
+                data = self.connection.get_next_samples(1, False)
+                if data is not None and data.sample_cnt > 0:
+                    break
+                time.sleep(0.01)
+
             if data is None or data.sample_cnt == 0:
-                return {'error': 'No data received'}
+                return {'error': f'No data received (timeout {timeout_s:.2f}s)'}
             
             if data.error_code < 0:
                 return {'error': f'Device error: {data.error_code}'}
             
+            def _extract_first_signal(signal_id: int) -> Optional[float]:
+                """
+                Robustly read a signal value from current sample.
+                Handles scalar and array-like return variants.
+                """
+                try:
+                    values = data.get_signal_values(signal_id, 0)
+                except Exception:
+                    return None
+
+                if values is None:
+                    return None
+                if isinstance(values, (float, int, np.floating)):
+                    value = float(values)
+                    if np.isnan(value):
+                        return None
+                    return value
+                try:
+                    if len(values) == 0:
+                        return None
+                    value = float(values[0])
+                    if np.isnan(value):
+                        return None
+                    return value
+                except Exception:
+                    return None
+
             # Extract thickness (signal 256)
             # Signal 256 in float format already includes refractive index correction
             # Value is already geometrical thickness in micrometers - NO manual correction needed!
-            thickness_values = data.get_signal_values(self.SIGNAL_THICKNESS, 0)
+            thickness = _extract_first_signal(self.SIGNAL_THICKNESS)
+            median1 = _extract_first_signal(self.SIGNAL_MEDIAN1)
+            available_ids = set()
+            try:
+                if data.signal_info:
+                    available_ids = {int(sig[1]) for sig in data.signal_info if len(sig) > 1}
+            except Exception:
+                available_ids = set()
 
-            # Some API versions return a scalar, others an array-like object.
-            # Handle both robustly to avoid "object of type 'numpy.float64' has no len()".
-            if isinstance(thickness_values, (float, int, np.floating)):
-                thickness = float(thickness_values)
-            else:
-                thickness = float(thickness_values[0]) if len(thickness_values) > 0 else None
+            def _extract_from_candidates(candidates, excluded_ids=None):
+                excluded_ids = excluded_ids or set()
+                for sig_id in candidates:
+                    if sig_id in excluded_ids:
+                        continue
+                    if sig_id in available_ids:
+                        value = _extract_first_signal(sig_id)
+                        if value is not None:
+                            return value, sig_id
+                return None, None
+
+            def _normalize_intensity(raw_value: Optional[float], sig_id: Optional[int]) -> Optional[float]:
+                """
+                Normalize intensity to a human-friendly percent-like value.
+                CHR signals such as 16648/16641 are often fixed-point with scale 1/16.
+                """
+                if raw_value is None or sig_id is None:
+                    return raw_value
+                if sig_id in (self.SIGNAL_ALT_QUALITY, self.SIGNAL_PEAK1_QI):
+                    # Apply fixed-point conversion when clearly out of percent range.
+                    if raw_value > 100.0:
+                        return raw_value / 16.0
+                return raw_value
+
+            # Keep intensity and quality strictly separate to avoid duplicated values.
+            # Observed CHR2 behavior: quality aligns with 257/16641 raw values,
+            # while 16648 behaves like intensity-like fixed-point value.
+            intensity, intensity_sig = _extract_from_candidates(
+                [self.SIGNAL_ALT_QUALITY, self.SIGNAL_PEAK1_QI]
+            )
+            intensity = _normalize_intensity(intensity, intensity_sig)
+            quality, _quality_sig = _extract_from_candidates(
+                [self.SIGNAL_INTENSITY, self.SIGNAL_PEAK1_QI, 258],
+                excluded_ids={intensity_sig} if intensity_sig is not None else set()
+            )
             
             # For interferometric mode, peak signals are not the same as confocal mode
             # We can try to get peak positions from spectrum if needed, but for now
@@ -350,8 +540,14 @@ class CHRocodileController:
             
             result = {
                 'thickness': thickness,
+                'median1': median1,
+                'intensity': intensity,
+                'quality': quality,
                 'peak1': peak1,
                 'peak2': peak2,
+                'intensity_signal_id': intensity_sig,
+                'quality_signal_id': _quality_sig,
+                'signal_snapshot': self._collect_signal_snapshot(data),
                 'timestamp': time.time()
             }
             
@@ -364,10 +560,31 @@ class CHRocodileController:
                     # using the _detect_peaks method
             
             return result
-            
+
         except Exception as e:
-            return {'error': f'Measurement error: {str(e)}'}
-    
+            err_str = str(e)
+            # -536451072: chrpy internal thread error — stream is dead, needs restart.
+            if '-536451072' in err_str:
+                self._recover_data_stream()
+            return {'error': f'Measurement error: {err_str}'}
+
+        finally:
+            self._measurement_lock.release()
+
+    def _recover_data_stream(self):
+        """Stop and restart the data stream after an internal thread error."""
+        self._stream_started = False
+        try:
+            self.connection.stop_data_stream()
+        except Exception:
+            pass
+        time.sleep(0.1)
+        try:
+            self.connection.start_data_stream()
+            self._stream_started = True
+        except Exception:
+            pass
+
     def start_continuous_measurement(self, interval_ms: int = 100, include_spectrum: bool = False):
         """
         Start continuous measurements at specified interval.
@@ -628,17 +845,39 @@ class CHRocodileController:
         if not self.connection or self.state != ConnectionState.CONNECTED:
             self.lamp_intensity = intensity
             return True, "Lamp intensity will be set on connection"
+
+        # If firmware was detected as not supporting lamp control, skip silently.
+        if self.lamp_control_supported is False:
+            self.lamp_intensity = intensity
+            return True, "Lamp control not supported by this device firmware (skipped)"
         
         try:
             resp = self.connection.exec('LIA', intensity)
             if resp.error_code != 0:
-                return False, f"Failed to set lamp intensity: {resp.error_code}"
+                # Some CHRocodile firmware variants reject LIA.
+                # Treat this as non-fatal to keep settings workflow usable.
+                self.lamp_control_supported = False
+                self.lamp_intensity = intensity
+                return True, (
+                    f"Warning: Lamp intensity command not accepted by device "
+                    f"(error code {resp.error_code})."
+                )
             
+            self.lamp_control_supported = True
             self.lamp_intensity = intensity
             return True, f"Lamp intensity set to {intensity}%"
             
         except Exception as e:
-            return False, f"Error setting lamp intensity: {str(e)}"
+            err = str(e)
+            # Known non-fatal behavior on some devices: command response error for LIA.
+            if "-536250368" in err or "Error in command response" in err:
+                self.lamp_control_supported = False
+                self.lamp_intensity = intensity
+                return True, (
+                    "Lamp intensity command not accepted by device firmware; "
+                    "skipping lamp update."
+                )
+            return False, f"Error setting lamp intensity: {err}"
     
     def get_configuration(self) -> Optional[dict]:
         """
@@ -651,7 +890,9 @@ class CHRocodileController:
             return None
         
         try:
-            responses = self.connection.get_conf()
+            # Suppress noisy stdout prints from wrapper internals (shared connection info).
+            with contextlib.redirect_stdout(io.StringIO()):
+                responses = self.connection.get_conf()
             config = {}
             for resp in responses:
                 if resp.cmd_id == CmdId.SODX:
@@ -673,6 +914,90 @@ class CHRocodileController:
             
         except Exception as e:
             return {'error': f"Failed to get configuration: {str(e)}"}
+
+    def read_current_settings(self) -> Optional[dict]:
+        """
+        Read current settings from the connected device and normalize them.
+
+        Returns:
+            Dictionary with normalized setting values or error dict.
+        """
+        config = self.get_configuration()
+        if config is None or 'error' in config:
+            return config if isinstance(config, dict) else {'error': 'No configuration available'}
+
+        def _first_scalar(value):
+            """Return first scalar from nested list/tuple/ndarray values."""
+            current = value
+            while isinstance(current, (list, tuple, np.ndarray)) and len(current) > 0:
+                current = current[0]
+            return current
+
+        settings = {
+            'measuring_rate': config.get('measuring_rate'),
+            'data_average': config.get('data_average'),
+            'spectrum_average': config.get('spectrum_average'),
+            'measuring_mode': config.get('measuring_mode'),
+            # Prefer direct query for lamp intensity; get_conf can be inconsistent.
+            'lamp_intensity': None,
+            'refractive_index': None,
+        }
+
+        def _query_first_arg(*query_variants):
+            """
+            Try query variants and return the first response argument.
+            Variants can be tuples like ('query', 'LIA') or ('exec_from_string', 'LIA ?').
+            """
+            for method_name, arg in query_variants:
+                try:
+                    if method_name == 'query':
+                        resp = self.connection.query(arg)
+                    else:
+                        resp = self.connection.exec_from_string(arg)
+                    if resp and getattr(resp, 'error_code', -1) == 0 and getattr(resp, 'args', None):
+                        return _first_scalar(resp.args)
+                except Exception:
+                    continue
+            return None
+
+        # Refractive indices are returned as a list/tuple (often n1, n2).
+        refractive_indices = config.get('refractive_indices')
+        if refractive_indices is not None:
+            settings['refractive_index'] = _first_scalar(refractive_indices)
+
+        # Keep controller cache aligned with what the device reports.
+        if settings['measuring_rate'] is not None:
+            settings['measuring_rate'] = _first_scalar(settings['measuring_rate'])
+            self.measuring_rate_hz = int(settings['measuring_rate'])
+        if settings['data_average'] is not None:
+            settings['data_average'] = _first_scalar(settings['data_average'])
+            self.data_average = int(settings['data_average'])
+        if settings['spectrum_average'] is not None:
+            settings['spectrum_average'] = _first_scalar(settings['spectrum_average'])
+            self.spectrum_average = int(settings['spectrum_average'])
+        if settings['measuring_mode'] is not None:
+            settings['measuring_mode'] = _first_scalar(settings['measuring_mode'])
+            self.measuring_mode = int(settings['measuring_mode'])
+        # Read lamp intensity via direct query only; treat missing value as unsupported.
+        lamp_value = _query_first_arg(('query', 'LIA'), ('exec_from_string', 'LIA ?'))
+        if lamp_value is not None:
+            lamp_value = _first_scalar(lamp_value)
+            try:
+                lamp_value = int(lamp_value)
+                if 0 <= lamp_value <= 100:
+                    settings['lamp_intensity'] = lamp_value
+                    self.lamp_intensity = lamp_value
+                    self.lamp_control_supported = True
+                else:
+                    self.lamp_control_supported = False
+            except Exception:
+                self.lamp_control_supported = False
+        else:
+            self.lamp_control_supported = False
+        if settings['refractive_index'] is not None:
+            self.refractive_index = float(settings['refractive_index'])
+
+        return settings
     
     def set_device_ip_address(self, ip_address: str, subnet_mask: str = "255.255.255.0", 
                               gateway: str = "192.168.170.1") -> Tuple[bool, str]:

@@ -49,7 +49,7 @@ class CHRocodileGUI:
         """
         self.root = root
         self.root.title("CHRocodile Film Thickness Measurement")
-        self.root.geometry("1400x800")
+        self.root.geometry("1750x900")
         
         # Device controller and simulator
         self.controller = CHRocodileController(data_callback=self.on_measurement_data)
@@ -64,9 +64,14 @@ class CHRocodileGUI:
         self.measurement_count = 0
         self.simulation_stop_event = None
         self.simulation_thread = None
+        self.spectrum_window = None
+        self.spectrum_enabled_var = tk.BooleanVar(value=False)
+        self.debug_print_signals_var = tk.BooleanVar(value=False)
         
         # Settings manager
         self.settings_manager = SettingsManager()
+        self.quality_threshold = self._load_quality_threshold_setting()
+        self.plc_thickness_source = self._load_plc_thickness_source_setting()
         
         # Setup file logging
         self._setup_file_logging()
@@ -192,7 +197,7 @@ class CHRocodileGUI:
                                         command=self.on_continuous_toggle, state=tk.DISABLED)
         self.continuous_btn.grid(row=0, column=3, padx=(0, 10))
         
-        # Row 2: Refractive index and spectrum download
+        # Row 2: Refractive index and spectrum window toggle
         row2_frame = ttk.Frame(measure_frame)
         row2_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
         
@@ -209,9 +214,21 @@ class CHRocodileGUI:
                                        command=self.on_dark_reference, state=tk.DISABLED)
         self.dark_ref_btn.grid(row=0, column=3, padx=(0, 10))
         
-        self.download_spectrum_btn = ttk.Button(row2_frame, text="Download Spectrum", 
-                                               command=self.on_download_spectrum, state=tk.DISABLED)
-        self.download_spectrum_btn.grid(row=0, column=4)
+        self.spectrum_toggle = ttk.Checkbutton(
+            row2_frame,
+            text="Show Spectrum Window",
+            variable=self.spectrum_enabled_var,
+            command=self.on_spectrum_toggle,
+            state=tk.DISABLED
+        )
+        self.spectrum_toggle.grid(row=0, column=4, padx=(5, 0))
+
+        self.debug_signals_toggle = ttk.Checkbutton(
+            row2_frame,
+            text="Debug Print Signals",
+            variable=self.debug_print_signals_var
+        )
+        self.debug_signals_toggle.grid(row=0, column=5, padx=(10, 0))
         
         # Device Settings Panel
         settings_frame = ttk.LabelFrame(top_frame, text="Device Settings", padding="5")
@@ -246,6 +263,14 @@ class CHRocodileGUI:
         self.view_config_btn = ttk.Button(settings_row1, text="View Config", 
                                           command=self.on_view_config, state=tk.DISABLED)
         self.view_config_btn.grid(row=0, column=7)
+
+        self.read_settings_btn = ttk.Button(
+            settings_row1,
+            text="Read Settings",
+            command=self.on_read_current_settings,
+            state=tk.DISABLED
+        )
+        self.read_settings_btn.grid(row=0, column=8, padx=(10, 0))
         
         # Row 2: Averaging
         settings_row2 = ttk.Frame(settings_frame)
@@ -260,6 +285,31 @@ class CHRocodileGUI:
         self.spectrum_avg_var = tk.StringVar(value="1")
         self.spectrum_avg_entry = ttk.Entry(settings_row2, textvariable=self.spectrum_avg_var, width=8)
         self.spectrum_avg_entry.grid(row=0, column=3)
+
+        ttk.Label(settings_row2, text="Quality Threshold:").grid(row=0, column=4, padx=(15, 5))
+        self.quality_threshold_var = tk.StringVar(value=f"{self.quality_threshold:.3f}")
+        self.quality_threshold_entry = ttk.Entry(settings_row2, textvariable=self.quality_threshold_var, width=8)
+        self.quality_threshold_entry.grid(row=0, column=5, padx=(0, 5))
+        self.quality_threshold_entry.bind("<Return>", lambda _e: self.on_set_quality_threshold())
+
+        self.set_quality_threshold_btn = ttk.Button(
+            settings_row2,
+            text="Set Threshold",
+            command=self.on_set_quality_threshold
+        )
+        self.set_quality_threshold_btn.grid(row=0, column=6)
+
+        ttk.Label(settings_row2, text="PLC Thickness Source:").grid(row=0, column=7, padx=(15, 5))
+        self.plc_thickness_source_var = tk.StringVar(value=self.plc_thickness_source)
+        self.plc_thickness_source_combo = ttk.Combobox(
+            settings_row2,
+            textvariable=self.plc_thickness_source_var,
+            values=["Thickness", "Median 1"],
+            state="readonly",
+            width=12
+        )
+        self.plc_thickness_source_combo.grid(row=0, column=8, padx=(0, 5))
+        self.plc_thickness_source_combo.bind("<<ComboboxSelected>>", self.on_plc_thickness_source_change)
         
         # Middle section: Display and plots
         middle_frame = ttk.Frame(main_frame)
@@ -278,28 +328,40 @@ class CHRocodileGUI:
         self.thickness_label.grid(row=0, column=1, sticky=tk.W, padx=(10, 0), pady=5)
         
         # Peak signals
-        ttk.Label(left_panel, text="Peak 1:", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
+        ttk.Label(left_panel, text="Median 1:", font=("Arial", 10)).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.median1_label = ttk.Label(left_panel, text="-- μm")
+        self.median1_label.grid(row=1, column=1, sticky=tk.W, padx=(10, 0), pady=5)
+
+        ttk.Label(left_panel, text="Peak 1:", font=("Arial", 10)).grid(row=2, column=0, sticky=tk.W, pady=5)
         self.peak1_label = ttk.Label(left_panel, text="--")
-        self.peak1_label.grid(row=1, column=1, sticky=tk.W, padx=(10, 0), pady=5)
+        self.peak1_label.grid(row=2, column=1, sticky=tk.W, padx=(10, 0), pady=5)
         
-        ttk.Label(left_panel, text="Peak 2:", font=("Arial", 10)).grid(row=2, column=0, sticky=tk.W, pady=5)
+        ttk.Label(left_panel, text="Peak 2:", font=("Arial", 10)).grid(row=3, column=0, sticky=tk.W, pady=5)
         self.peak2_label = ttk.Label(left_panel, text="--")
-        self.peak2_label.grid(row=2, column=1, sticky=tk.W, padx=(10, 0), pady=5)
+        self.peak2_label.grid(row=3, column=1, sticky=tk.W, padx=(10, 0), pady=5)
+
+        ttk.Label(left_panel, text="Intensity:", font=("Arial", 10)).grid(row=4, column=0, sticky=tk.W, pady=5)
+        self.intensity_label = ttk.Label(left_panel, text="--")
+        self.intensity_label.grid(row=4, column=1, sticky=tk.W, padx=(10, 0), pady=5)
+
+        ttk.Label(left_panel, text="Quality:", font=("Arial", 10)).grid(row=5, column=0, sticky=tk.W, pady=5)
+        self.quality_label = ttk.Label(left_panel, text="--")
+        self.quality_label.grid(row=5, column=1, sticky=tk.W, padx=(10, 0), pady=5)
         
         # Measurement count
-        ttk.Label(left_panel, text="Measurements:", font=("Arial", 10)).grid(row=3, column=0, sticky=tk.W, pady=5)
+        ttk.Label(left_panel, text="Measurements:", font=("Arial", 10)).grid(row=6, column=0, sticky=tk.W, pady=5)
         self.count_label = ttk.Label(left_panel, text="0")
-        self.count_label.grid(row=3, column=1, sticky=tk.W, padx=(10, 0), pady=5)
+        self.count_label.grid(row=6, column=1, sticky=tk.W, padx=(10, 0), pady=5)
         
         # Separator
-        ttk.Separator(left_panel, orient=tk.HORIZONTAL).grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=10)
+        ttk.Separator(left_panel, orient=tk.HORIZONTAL).grid(row=7, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=10)
         
         # Control buttons
         self.clear_plots_btn = ttk.Button(left_panel, text="Clear Plots", command=self.on_clear_plots)
-        self.clear_plots_btn.grid(row=5, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
+        self.clear_plots_btn.grid(row=8, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
         
         self.export_btn = ttk.Button(left_panel, text="Export Data", command=self.on_export_data)
-        self.export_btn.grid(row=6, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
+        self.export_btn.grid(row=9, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
         
         # Right panel: Plots
         right_panel = ttk.Frame(middle_frame)
@@ -317,14 +379,14 @@ class CHRocodileGUI:
         thickness_frame.columnconfigure(0, weight=1)
         thickness_frame.rowconfigure(0, weight=1)
         
-        # Spectrum plot frame
-        spectrum_frame = ttk.Frame(right_panel)
-        spectrum_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        spectrum_frame.columnconfigure(0, weight=1)
-        spectrum_frame.rowconfigure(0, weight=1)
+        # Intensity/quality plot frame
+        signal_frame = ttk.Frame(right_panel)
+        signal_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        signal_frame.columnconfigure(0, weight=1)
+        signal_frame.rowconfigure(0, weight=1)
         
         # Setup canvases in their frames (this handles the pack/grid conflict)
-        self.plotter.setup_canvases(thickness_frame, spectrum_frame)
+        self.plotter.setup_canvases(thickness_frame, signal_frame)
         
         # Bottom: Status bar
         status_frame = ttk.Frame(main_frame)
@@ -382,7 +444,23 @@ class CHRocodileGUI:
         self.logger.info("=" * 80)
         self.logger.info("CHRocodile Application Started")
         self.logger.info(f"Log file: {self.log_file_path}")
+        self.logger.info(f"Quality threshold: {self.quality_threshold:.3f}")
         self.logger.info("=" * 80)
+
+    def _load_quality_threshold_setting(self) -> float:
+        """Load persisted quality threshold setting and clamp to valid range."""
+        try:
+            threshold = float(self.settings_manager.get('device.quality_threshold', 0.0))
+        except Exception:
+            threshold = 0.0
+        return max(0.0, threshold)
+
+    def _load_plc_thickness_source_setting(self) -> str:
+        """Load persisted PLC thickness source setting."""
+        source = self.settings_manager.get('device.plc_thickness_source', 'Thickness')
+        if source not in ("Thickness", "Median 1"):
+            source = "Thickness"
+        return source
     
     def _log_status(self, message: str):
         """Add message to status text area and log file."""
@@ -420,19 +498,41 @@ class CHRocodileGUI:
             self._log_status(f"Error: {error_msg}")
             if hasattr(self, 'logger'):
                 self.logger.error(f"Measurement error: {error_msg}")
+
+            # Ensure PLC handshake is not left hanging on measurement errors.
+            if self.beckhoff_ads_interface and self.beckhoff_ads_interface.is_running():
+                plc_error_data = {
+                    "thickness": None,
+                    "peak1": None,
+                    "peak2": None,
+                    "timestamp": time.time(),
+                    "measurement_count": self.measurement_count,
+                    "error": error_msg,
+                }
+                self.beckhoff_ads_interface.write_measurement_result(plc_error_data)
             return
         
         # Update display
         thickness = data.get('thickness')
+        median1 = data.get('median1')
         if thickness is not None:
             self.thickness_label.config(text=f"{thickness:.2f} μm")
+        else:
+            self.thickness_label.config(text="-- μm")
+        if median1 is not None:
+            self.median1_label.config(text=f"{median1:.2f} μm")
+        else:
+            self.median1_label.config(text="-- μm")
         
         peak1 = data.get('peak1')
         peak2 = data.get('peak2')
+        intensity = data.get('intensity')
+        quality = data.get('quality')
+        signal_snapshot = data.get('signal_snapshot')
 
         # Update spectrum plot if spectrum data is available
         spectrum = data.get('spectrum')
-        if spectrum is not None:
+        if spectrum is not None and self.spectrum_enabled_var.get():
             # Detect peaks from raw spectrum and use them as fallback when device
             # does not provide peak values directly in measurement response.
             peak1_pos, peak2_pos = self._detect_peaks(spectrum)
@@ -452,32 +552,73 @@ class CHRocodileGUI:
         else:
             self.peak2_label.config(text="--")
 
+        if intensity is not None:
+            self.intensity_label.config(text=f"{float(intensity):.3f}")
+        else:
+            self.intensity_label.config(text="--")
+
+        if quality is not None:
+            self.quality_label.config(text=f"{float(quality):.3f}")
+        else:
+            self.quality_label.config(text="--")
+
         # Update thickness plot
         timestamp = data.get('timestamp', time.time())
-        if thickness is not None:
-            self.plotter.update_thickness_plot(timestamp, thickness)
+        below_quality_threshold = (
+            quality is not None and float(quality) < float(self.quality_threshold)
+        )
+        if thickness is not None or median1 is not None:
+            self.plotter.update_thickness_plot(
+                timestamp,
+                thickness,
+                median1=median1,
+                below_quality_threshold=below_quality_threshold
+            )
+        self.plotter.update_signal_plot(timestamp, intensity, quality)
         
         # Update count
         self.measurement_count += 1
         self.count_label.config(text=str(self.measurement_count))
+
+        if self.debug_print_signals_var.get() and signal_snapshot:
+            print(
+                f"[CHR DEBUG] Measurement #{self.measurement_count} "
+                f"signals={signal_snapshot.get('signal_ids')} "
+                f"values={signal_snapshot.get('signals')} "
+                f"intensity_sig={data.get('intensity_signal_id')} "
+                f"quality_sig={data.get('quality_signal_id')}"
+            )
         
         # Log measurement to file
         if hasattr(self, 'logger'):
             thickness_text = f"{thickness:.3f}" if thickness is not None else "N/A"
+            median1_text = f"{median1:.3f}" if median1 is not None else "N/A"
             peak1_text = f"{peak1:.1f}" if peak1 is not None else "N/A"
             peak2_text = f"{peak2:.1f}" if peak2 is not None else "N/A"
+            intensity_text = f"{float(intensity):.1f}" if intensity is not None else "N/A"
+            quality_text = f"{float(quality):.1f}" if quality is not None else "N/A"
             self.logger.info(
                 f"Measurement #{self.measurement_count}: "
-                f"Thickness={thickness_text} μm, Peak1={peak1_text}, Peak2={peak2_text}"
+                f"Thickness={thickness_text} μm, Median1={median1_text} μm, "
+                f"Peak1={peak1_text}, Peak2={peak2_text}, "
+                f"Intensity={intensity_text}, Quality={quality_text}"
             )
         
         # Send measurement result to Beckhoff PLC via ADS if interface is active
         # This ensures PLC-triggered measurements complete the handshake properly
         if self.beckhoff_ads_interface and self.beckhoff_ads_interface.is_running():
+            selected_source = self.plc_thickness_source_var.get()
+            raw_plc_value = median1 if selected_source == "Median 1" else thickness
+            plc_thickness = raw_plc_value
+            if plc_thickness is not None and below_quality_threshold:
+                plc_thickness = 0.0
             plc_data = {
-                "thickness": thickness,
+                "thickness": plc_thickness,
+                "median1": median1,
                 "peak1": peak1,
                 "peak2": peak2,
+                "intensity": intensity,
+                "quality": quality,
                 "timestamp": data.get('timestamp'),
                 "measurement_count": self.measurement_count
             }
@@ -524,15 +665,19 @@ class CHRocodileGUI:
             self.config_ip_btn.config(state=tk.NORMAL)
             self.single_measure_btn.config(state=tk.NORMAL)
             self.continuous_btn.config(state=tk.NORMAL)
-            self.download_spectrum_btn.config(state=tk.NORMAL)
+            self.spectrum_toggle.config(state=tk.NORMAL)
             self.set_refractive_btn.config(state=tk.NORMAL)
             self.dark_ref_btn.config(state=tk.NORMAL)
             self.apply_settings_btn.config(state=tk.NORMAL)
             self.view_config_btn.config(state=tk.NORMAL)
+            self.read_settings_btn.config(state=tk.NORMAL)
             self._log_status(f"Connected: {message}")
             if hasattr(self, 'logger'):
                 ip_address = self.ip_entry.get().strip()
                 self.logger.info(f"Device connected: IP={ip_address}, Message={message}")
+            # Always read device settings immediately after connection and
+            # sync UI fields without showing a blocking error popup.
+            self.on_read_current_settings(show_error_dialog=False)
         else:
             self.status_label.config(text="Connection Failed", foreground="red")
             self.connect_btn.config(state=tk.NORMAL)
@@ -553,11 +698,14 @@ class CHRocodileGUI:
             self.config_ip_btn.config(state=tk.DISABLED)
             self.single_measure_btn.config(state=tk.DISABLED)
             self.continuous_btn.config(state=tk.DISABLED)
-            self.download_spectrum_btn.config(state=tk.DISABLED)
+            self.spectrum_toggle.config(state=tk.DISABLED)
             self.set_refractive_btn.config(state=tk.DISABLED)
             self.dark_ref_btn.config(state=tk.DISABLED)
             self.apply_settings_btn.config(state=tk.DISABLED)
             self.view_config_btn.config(state=tk.DISABLED)
+            self.read_settings_btn.config(state=tk.DISABLED)
+            self.spectrum_enabled_var.set(False)
+            self._close_spectrum_window()
             self._log_status("Disconnected")
             if hasattr(self, 'logger'):
                 self.logger.info("Device disconnected")
@@ -675,11 +823,12 @@ class CHRocodileGUI:
             # Enable controls even without connection
             self.single_measure_btn.config(state=tk.NORMAL)
             self.continuous_btn.config(state=tk.NORMAL)
-            self.download_spectrum_btn.config(state=tk.NORMAL)
+            self.spectrum_toggle.config(state=tk.NORMAL)
             self.set_refractive_btn.config(state=tk.DISABLED)  # Still need connection for this
             self.dark_ref_btn.config(state=tk.DISABLED)
             self.apply_settings_btn.config(state=tk.DISABLED)
             self.view_config_btn.config(state=tk.DISABLED)
+            self.read_settings_btn.config(state=tk.DISABLED)
         else:
             self._log_status("Simulation mode disabled")
             if hasattr(self, 'logger'):
@@ -688,27 +837,45 @@ class CHRocodileGUI:
             if not self.controller.is_connected():
                 self.single_measure_btn.config(state=tk.DISABLED)
                 self.continuous_btn.config(state=tk.DISABLED)
-                self.download_spectrum_btn.config(state=tk.DISABLED)
+                self.spectrum_toggle.config(state=tk.DISABLED)
                 self.set_refractive_btn.config(state=tk.DISABLED)
                 self.dark_ref_btn.config(state=tk.DISABLED)
                 self.apply_settings_btn.config(state=tk.DISABLED)
                 self.view_config_btn.config(state=tk.DISABLED)
+                self.read_settings_btn.config(state=tk.DISABLED)
+            if not self.controller.is_connected():
+                self.spectrum_enabled_var.set(False)
+                self._close_spectrum_window()
     
-    def on_single_measurement(self):
+    def on_single_measurement(self, include_spectrum: Optional[bool] = None):
         """Handle single measurement button click."""
+        if include_spectrum is None:
+            include_spectrum = bool(self.spectrum_enabled_var.get())
+
         def measure_thread():
             if self.simulation_mode:
                 data = self.simulator.simulate_measurement()
                 result = {
                     'thickness': data.thickness,
+                    'median1': data.median1,
+                    'intensity': data.intensity,
+                    'quality': data.quality,
                     'peak1': data.peak1,
                     'peak2': data.peak2,
-                    'spectrum': data.spectrum,  # Include spectrum by default
+                    'spectrum': data.spectrum if include_spectrum else None,
+                    'signal_snapshot': {
+                        'signal_ids': ['sim_thickness', 'sim_median1', 'sim_intensity', 'sim_quality'],
+                        'signals': {
+                            'sim_thickness': data.thickness,
+                            'sim_median1': data.median1,
+                            'sim_intensity': data.intensity,
+                            'sim_quality': data.quality,
+                        }
+                    },
                     'timestamp': data.timestamp
                 }
             else:
-                # Always include spectrum for single measurements
-                result = self.controller.get_single_measurement(include_spectrum=True)
+                result = self.controller.get_single_measurement(include_spectrum=include_spectrum)
             
             self.root.after(0, lambda: self._handle_measurement_data(result))
         
@@ -747,11 +914,12 @@ class CHRocodileGUI:
             if self.simulation_mode:
                 self._start_simulation_continuous(interval_ms)
             else:
-                # Start continuous measurement with spectrum download enabled by default
-                self.controller.start_continuous_measurement(interval_ms, include_spectrum=True)
+                include_spectrum = bool(self.spectrum_enabled_var.get())
+                self.controller.start_continuous_measurement(interval_ms, include_spectrum=include_spectrum)
             
             self.continuous_btn.config(text="⏸ Stop Continuous")
-            self._log_status(f"Continuous measurement started (interval: {interval_ms} ms, with spectrum)")
+            mode_text = "with spectrum window updates" if self.spectrum_enabled_var.get() else "fast mode"
+            self._log_status(f"Continuous measurement started (interval: {interval_ms} ms, {mode_text}).")
     
     def _start_simulation_continuous(self, interval_ms: int):
         """Start continuous simulation measurements."""
@@ -765,9 +933,21 @@ class CHRocodileGUI:
                     data = self.simulator.simulate_measurement()
                     result = {
                         'thickness': data.thickness,
+                        'median1': data.median1,
+                        'intensity': data.intensity,
+                        'quality': data.quality,
                         'peak1': data.peak1,
                         'peak2': data.peak2,
-                        'spectrum': data.spectrum,  # Include spectrum by default
+                        'spectrum': data.spectrum if self.spectrum_enabled_var.get() else None,
+                        'signal_snapshot': {
+                            'signal_ids': ['sim_thickness', 'sim_median1', 'sim_intensity', 'sim_quality'],
+                            'signals': {
+                                'sim_thickness': data.thickness,
+                                'sim_median1': data.median1,
+                                'sim_intensity': data.intensity,
+                                'sim_quality': data.quality,
+                            }
+                        },
                         'timestamp': data.timestamp
                     }
                     self.data_queue.put(result)
@@ -793,8 +973,26 @@ class CHRocodileGUI:
         self.simulation_thread.start()
         print(f"Simulation thread started, interval={interval_ms}ms")
     
-    def on_download_spectrum(self):
-        """Handle download spectrum button click."""
+    def on_spectrum_toggle(self):
+        """Enable or disable spectrum acquisition and separate spectrum window."""
+        enabled = bool(self.spectrum_enabled_var.get())
+        if enabled:
+            if not self.simulation_mode and not self.controller.is_connected():
+                self.spectrum_enabled_var.set(False)
+                messagebox.showwarning("Not Connected", "Connect to the device or enable simulation mode first.")
+                return
+            self._open_spectrum_window()
+            self._log_status("Spectrum window enabled (spectrum data acquisition active)")
+            self._request_single_spectrum_update()
+        else:
+            self._close_spectrum_window()
+            self._log_status("Spectrum window disabled (spectrum acquisition off)")
+
+    def _request_single_spectrum_update(self):
+        """Fetch one spectrum snapshot and display it in the spectrum window."""
+        if not self.spectrum_enabled_var.get():
+            return
+
         def download_thread():
             if self.simulation_mode:
                 data = self.simulator.simulate_measurement()
@@ -804,12 +1002,38 @@ class CHRocodileGUI:
                     'peak2': data.peak2,
                     'timestamp': data.timestamp
                 }
-            else:
+            elif self.controller.is_connected():
                 result = self.controller.download_spectrum()
-            
+            else:
+                result = {'error': 'Connect to device or enable simulation mode to view spectrum'}
             self.root.after(0, lambda: self._handle_spectrum_data(result))
-        
+
         threading.Thread(target=download_thread, daemon=True).start()
+
+    def _open_spectrum_window(self):
+        """Create spectrum toplevel window if needed."""
+        if self.spectrum_window and self.spectrum_window.winfo_exists():
+            self.spectrum_window.lift()
+            self.spectrum_window.focus_force()
+            return
+
+        self.spectrum_window = tk.Toplevel(self.root)
+        self.spectrum_window.title("Interferometric Spectrum")
+        self.spectrum_window.geometry("900x500")
+        self.spectrum_window.protocol("WM_DELETE_WINDOW", self._on_spectrum_window_closed)
+        self.plotter.setup_spectrum_window(self.spectrum_window)
+
+    def _close_spectrum_window(self):
+        """Close spectrum window and stop plotting spectra."""
+        if self.spectrum_window and self.spectrum_window.winfo_exists():
+            self.spectrum_window.destroy()
+        self.spectrum_window = None
+        self.plotter.close_spectrum_window()
+
+    def _on_spectrum_window_closed(self):
+        """Handle manual closing of spectrum window."""
+        self.spectrum_enabled_var.set(False)
+        self._close_spectrum_window()
     
     def _handle_spectrum_data(self, data: dict):
         """Handle spectrum data."""
@@ -979,6 +1203,38 @@ class CHRocodileGUI:
             
         except ValueError:
             messagebox.showerror("Error", "Invalid refractive index value")
+
+    def on_set_quality_threshold(self):
+        """Set and persist quality threshold used for Beckhoff thickness forwarding."""
+        try:
+            threshold = float(self.quality_threshold_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Value", "Quality threshold must be a valid non-negative number.")
+            return
+
+        if threshold < 0.0:
+            messagebox.showerror("Invalid Value", "Quality threshold must be non-negative.")
+            return
+
+        self.quality_threshold = float(threshold)
+        self.quality_threshold_var.set(f"{self.quality_threshold:.3f}")
+        self.settings_manager.set('device.quality_threshold', self.quality_threshold)
+        self.settings_manager.save()
+        self._log_status(
+            f"Quality threshold set to {self.quality_threshold:.3f} "
+            f"(values below this send thickness=0 to Beckhoff)"
+        )
+
+    def on_plc_thickness_source_change(self, event=None):
+        """Persist selected PLC thickness source."""
+        source = self.plc_thickness_source_var.get()
+        if source not in ("Thickness", "Median 1"):
+            source = "Thickness"
+            self.plc_thickness_source_var.set(source)
+        self.plc_thickness_source = source
+        self.settings_manager.set('device.plc_thickness_source', source)
+        self.settings_manager.save()
+        self._log_status(f"PLC thickness source set to: {source}")
     
     def _on_refractive_index_set(self, success: bool, message: str):
         """Handle refractive index setting completion."""
@@ -1134,6 +1390,7 @@ class CHRocodileGUI:
         
         def apply_thread():
             errors = []
+            warnings = []
             
             # Measuring rate
             try:
@@ -1155,16 +1412,22 @@ class CHRocodileGUI:
                 errors.append(f"Mode: {msg}")
             
             # Lamp intensity
-            try:
-                intensity = int(self.lamp_intensity_var.get())
-                if intensity < 0 or intensity > 100:
-                    errors.append("Lamp intensity must be between 0 and 100%")
-                else:
-                    success, msg = self.controller.set_lamp_intensity(intensity)
-                    if not success:
-                        errors.append(f"Lamp: {msg}")
-            except ValueError:
-                errors.append("Invalid lamp intensity value")
+            if getattr(self.controller, 'lamp_control_supported', None) is False:
+                # Firmware does not support lamp control; skip to avoid false errors.
+                pass
+            else:
+                try:
+                    intensity = int(self.lamp_intensity_var.get())
+                    if intensity < 0 or intensity > 100:
+                        errors.append("Lamp intensity must be between 0 and 100%")
+                    else:
+                        success, msg = self.controller.set_lamp_intensity(intensity)
+                        if not success:
+                            errors.append(f"Lamp: {msg}")
+                        elif msg.startswith("Warning:"):
+                            warnings.append(f"Lamp: {msg}")
+                except ValueError:
+                    errors.append("Invalid lamp intensity value")
             
             # Averaging
             try:
@@ -1181,18 +1444,78 @@ class CHRocodileGUI:
             except ValueError:
                 errors.append("Invalid averaging values")
             
-            self.root.after(0, lambda: self._on_settings_applied(errors))
+            self.root.after(0, lambda: self._on_settings_applied(errors, warnings))
         
         threading.Thread(target=apply_thread, daemon=True).start()
     
-    def _on_settings_applied(self, errors: list):
+    def _on_settings_applied(self, errors: list, warnings: list = None):
         """Handle settings application completion."""
+        warnings = warnings or []
+        # Re-sync ADS handshake after settings writes to prevent stale busy/ready
+        # states from breaking subsequent PLC-triggered measurements.
+        if self.beckhoff_ads_interface and self.beckhoff_ads_interface.is_running():
+            self.beckhoff_ads_interface.reset_handshake_state()
+
         if errors:
             messagebox.showerror("Settings Error", "\n".join(errors))
             self._log_status(f"Settings application errors: {', '.join(errors)}")
+        elif warnings:
+            warning_text = "\n".join(warnings)
+            self._log_status(f"Settings applied with warnings: {', '.join(warnings)}")
+            messagebox.showwarning("Settings Applied with Warnings", warning_text)
         else:
             self._log_status("Device settings applied successfully")
             messagebox.showinfo("Success", "Device settings applied successfully")
+
+    def on_read_current_settings(self, show_error_dialog: bool = True):
+        """Read current settings from the device and apply them to UI fields."""
+        if self.simulation_mode:
+            messagebox.showinfo("Read Settings", "Simulation mode: No device settings available")
+            return
+
+        def read_settings_thread():
+            settings = self.controller.read_current_settings()
+            self.root.after(0, lambda: self._on_current_settings_loaded(settings, show_error_dialog))
+
+        threading.Thread(target=read_settings_thread, daemon=True).start()
+
+    def _on_current_settings_loaded(self, settings: Optional[dict], show_error_dialog: bool = True):
+        """Handle completion of read-current-settings request."""
+        if settings is None or 'error' in settings:
+            error_msg = settings.get('error', 'Failed to read current settings') if settings else 'Failed to read current settings'
+            self._log_status(f"Read settings failed: {error_msg}")
+            if show_error_dialog:
+                messagebox.showerror("Read Settings Error", error_msg)
+            return
+
+        rate = settings.get('measuring_rate')
+        if rate is not None:
+            self.measuring_rate_var.set(str(int(rate)))
+
+        mode = settings.get('measuring_mode')
+        if mode is not None:
+            self.measuring_mode_var.set("Chromatic Confocal" if int(mode) == 0 else "Interferometric")
+
+        lamp = settings.get('lamp_intensity')
+        if lamp is not None:
+            self.lamp_intensity_var.set(str(int(lamp)))
+        elif getattr(self.controller, 'lamp_control_supported', None) is False:
+            self.lamp_intensity_var.set("N/A")
+            self._log_status("Lamp intensity read not supported by this firmware")
+
+        data_avg = settings.get('data_average')
+        if data_avg is not None:
+            self.data_avg_var.set(str(int(data_avg)))
+
+        spectrum_avg = settings.get('spectrum_average')
+        if spectrum_avg is not None:
+            self.spectrum_avg_var.set(str(int(spectrum_avg)))
+
+        refractive_index = settings.get('refractive_index')
+        if refractive_index is not None:
+            self.refractive_index_var.set(f"{float(refractive_index):.6g}")
+
+        self._log_status("Current device settings loaded into UI")
     
     def on_view_config(self):
         """Handle view configuration button click."""
@@ -1413,7 +1736,8 @@ class CHRocodileGUI:
         """
         if command == "trigger_measurement":
             # Trigger a single measurement from PLC
-            self.root.after(0, self.on_single_measurement)
+            # Use fast path for PLC trigger (no spectrum download).
+            self.root.after(0, lambda: self.on_single_measurement(include_spectrum=False))
             return {
                 "triggered": True,
                 "message": "Measurement triggered"

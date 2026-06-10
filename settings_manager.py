@@ -37,7 +37,9 @@ class SettingsManager:
             }
         },
         "device": {
-            "default_ip": "192.168.170.2"
+            "default_ip": "192.168.170.2",
+            "quality_threshold": 0.0,
+            "plc_thickness_source": "Thickness"
         }
     }
     

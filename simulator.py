@@ -14,6 +14,9 @@ from dataclasses import dataclass
 class SimulatedData:
     """Simulated data structure matching the Data class interface"""
     thickness: float  # Thickness in micrometers (signal 256 in real device)
+    median1: float    # Median 1 in micrometers (signal 260 in real device)
+    intensity: float  # Signal intensity (%)
+    quality: float    # Signal quality (%)
     peak1: float      # Peak 1 position (extracted from spectrum)
     peak2: float      # Peak 2 position (extracted from spectrum)
     spectrum: np.ndarray  # Raw interferometric pattern
@@ -76,6 +79,23 @@ class CHRocodileSimulator:
         peak2 = base_peak2 + self.rng.normal(0, 100)
         
         return float(peak1), float(peak2)
+
+    def generate_intensity_quality(self, thickness: float) -> Tuple[float, float]:
+        """
+        Generate simulated intensity and quality values in arbitrary units.
+
+        Args:
+            thickness: Thickness value in microns
+
+        Returns:
+            Tuple of (intensity, quality)
+        """
+        # Keep values in realistic ranges with a mild dependence on thickness.
+        intensity = 65.0 + (thickness - 90.0) * 0.2 + self.rng.normal(0, 4.0)
+        quality = 80.0 + (thickness - 90.0) * 0.1 + self.rng.normal(0, 3.0)
+        intensity = float(np.clip(intensity, 0.0, 100.0))
+        quality = float(np.clip(quality, 0.0, 100.0))
+        return intensity, quality
     
     def generate_spectrum(self, thickness: float, num_points: int = 1200) -> np.ndarray:
         """
@@ -135,11 +155,16 @@ class CHRocodileSimulator:
             SimulatedData object containing all measurement data
         """
         thickness = self.generate_thickness()
+        median1 = float(thickness + self.rng.normal(0, 0.5))
+        intensity, quality = self.generate_intensity_quality(thickness)
         peak1, peak2 = self.generate_peak_signals(thickness)
         spectrum = self.generate_spectrum(thickness)
         
         return SimulatedData(
             thickness=thickness,
+            median1=median1,
+            intensity=intensity,
+            quality=quality,
             peak1=peak1,
             peak2=peak2,
             spectrum=spectrum,

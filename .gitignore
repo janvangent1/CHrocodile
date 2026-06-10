@@ -43,6 +43,7 @@ Thumbs.db
 
 # Project specific
 *.log
+*.log.*
 test_*.py
 
 # Exclude docs folder
