@@ -118,7 +118,7 @@ class CHRocodileGUI:
         
         ttk.Label(conn_frame, text="IP Address:").grid(row=0, column=0, padx=(0, 5))
         self.ip_entry = ttk.Entry(conn_frame, width=15)
-        self.ip_entry.insert(0, "132.31.40.111")
+        self.ip_entry.insert(0, "132.31.40.110")
         self.ip_entry.grid(row=0, column=1, padx=(0, 5))
         
         self.config_ip_btn = ttk.Button(conn_frame, text="Configure Device IP", 
