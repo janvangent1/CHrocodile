@@ -13,6 +13,11 @@ block_cipher = None
 # Collect all data files
 datas = []
 
+# Application icon (window title bar + bundled for runtime)
+icon_path = os.path.abspath(os.path.join('assets', 'chrocodile.ico'))
+if os.path.exists(icon_path):
+    datas.append((icon_path, 'assets'))
+
 # Add chrocodilelib directory (entire directory structure)
 chrocodilelib_path = os.path.join('chrocodilelib')
 if os.path.exists(chrocodilelib_path):
@@ -144,7 +149,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,  # UPX can strip or corrupt embedded Windows icons
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,  # No console window for GUI app
@@ -153,5 +158,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # Add icon path here if you have one
+    icon=icon_path if os.path.exists(icon_path) else None,
 )

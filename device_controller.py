@@ -96,6 +96,10 @@ class CHRocodileController:
         self._active_output_signals = []  # Signal IDs confirmed by device after SODX
         self._last_sample_counter = None  # Detect stale / repeated buffer reads
         self._buffer_backlog_warn_ts = 0.0  # Rate-limit backlog console messages
+        self._last_recover_ts = 0.0  # Rate-limit full connection reopens
+        self._recover_min_interval_s = 3.0
+        # When True, avoid STO/full reopen so CHR native software can stay connected.
+        self.coexist_with_chr_software = True
 
     def _data_single_sample(self, data, sample_no: int = 0):
         """Return a Data object containing only one sample row."""
@@ -134,11 +138,16 @@ class CHRocodileController:
         except Exception:
             return None
 
-    def _drain_stream_to_latest(self, batch_size: int = 256, max_batches: int = 8) -> Tuple[Optional[object], int]:
+    def _drain_stream_to_latest(
+        self,
+        batch_size: int = 512,
+        max_batches: int = 64,
+    ) -> Tuple[Optional[object], int]:
         """
         Drain the chrpy receive FIFO and return the newest sample.
 
         Uses batch reads (one DLL call per chunk) instead of one call per sample.
+        Caps are high enough to catch up after multi-second trigger gaps at kHz rates.
         """
         if not self.connection:
             return None, 0
@@ -152,7 +161,7 @@ class CHRocodileController:
                 data = self.connection.get_next_samples(batch_size, False)
             except APIException as exc:
                 err_str = str(exc)
-                if '-536580864' in err_str:
+                if '-536580864' in err_str or '-536580859' in err_str or '-536580860' in err_str:
                     print("[STREAM] Sample stream out of sync — flushing buffer")
                     self._flush_stream_buffer()
                     continue
@@ -173,6 +182,69 @@ class CHRocodileController:
 
         return self._data_single_sample(latest_data, latest_idx), drained
 
+    def _read_fresh_sample(self, timeout_s: float, force_flush: bool = False) -> Tuple[Optional[object], int]:
+        """
+        Return the newest live sample, discarding FIFO backlog.
+
+        Important: never flush away a sample we already successfully drained.
+        Flushing after a large drain was discarding good data and then timing out
+        waiting for the next packet — which also stresses chrpy into
+        Internal thread error (-536451072).
+        """
+        drained_total = 0
+        latest = None
+
+        if force_flush:
+            self._flush_stream_buffer()
+            time.sleep(0.02)
+
+        deadline = time.time() + max(0.2, timeout_s)
+        while time.time() < deadline:
+            try:
+                batch, drained = self._drain_stream_to_latest(
+                    batch_size=256,
+                    max_batches=16,
+                )
+            except Exception as exc:
+                if self._is_data_format_missing_error(exc) or self._is_stream_dead_error(exc):
+                    raise
+                print(f"[BUFFER] Drain failed: {exc}")
+                time.sleep(0.02)
+                continue
+
+            drained_total += drained
+            if batch is not None and batch.sample_cnt > 0:
+                latest = batch
+                # Short drain means the FIFO is caught up — use this sample now.
+                if drained < (256 * 16):
+                    return latest, drained_total
+                # Still a huge backlog: keep draining for newer samples.
+                continue
+
+            # Buffer empty this pass.
+            if latest is not None:
+                return latest, drained_total
+            time.sleep(0.01)
+
+        return latest, drained_total
+
+    @staticmethod
+    def _sample_counter_stale(previous: Optional[int], current: Optional[int]) -> bool:
+        """
+        True when the sample counter did not advance.
+
+        Signal 83 is typically uint16 and wraps at 65536 — that wrap must NOT be
+        treated as a stale/repeated buffer read.
+        """
+        if previous is None or current is None:
+            return False
+        if current > previous:
+            return False
+        # uint16 wrap (e.g. 65137 -> 1649)
+        if previous > 50000 and current < 10000:
+            return False
+        return True
+
     def _query_output_signals(self) -> list:
         """Return the active SODX signal list reported by the device."""
         if not self.connection:
@@ -191,6 +263,119 @@ class CHRocodileController:
             pass
         return []
 
+    def _preferred_sodx_candidates(self) -> list:
+        """Output signal layouts to try, best first."""
+        return [
+            [
+                self.SIGNAL_SAMPLE_COUNTER,
+                self.SIGNAL_INTENSITY,
+                self.SIGNAL_THICKNESS,
+                self.SIGNAL_QUALITY,
+                self.SIGNAL_MEDIAN1,
+            ],
+            [
+                self.SIGNAL_SAMPLE_COUNTER,
+                self.SIGNAL_THICKNESS,
+                self.SIGNAL_QUALITY,
+                self.SIGNAL_MEDIAN1,
+            ],
+            [
+                self.SIGNAL_THICKNESS,
+                self.SIGNAL_QUALITY,
+                self.SIGNAL_MEDIAN1,
+            ],
+            [self.SIGNAL_THICKNESS, self.SIGNAL_QUALITY],
+            [self.SIGNAL_THICKNESS],
+        ]
+
+    def _sodx_meets_minimum(self, signals: list) -> bool:
+        """True when the device already streams enough signals for measurements."""
+        if not signals:
+            return False
+        sig_set = {int(x) for x in signals}
+        if self.SIGNAL_THICKNESS not in sig_set:
+            return False
+        if (
+            self.SIGNAL_QUALITY not in sig_set
+            and self.SIGNAL_MEDIAN1 not in sig_set
+        ):
+            return False
+        return True
+
+    def _pick_matching_sodx_candidate(self, current: list) -> Optional[list]:
+        """Return the best preferred SODX layout already satisfied by the device."""
+        if not current:
+            return None
+        current_set = {int(x) for x in current}
+        for candidate in self._preferred_sodx_candidates():
+            if set(candidate).issubset(current_set):
+                return candidate
+        if self._sodx_meets_minimum(current):
+            return list(current)
+        return None
+
+    def _try_join_existing_stream(self, prefix: str = "") -> bool:
+        """
+        Attach to an already-running stream without STO or SODX changes.
+
+        Lets CHR native software and this app share the device.
+        """
+        signals = self._query_output_signals()
+        if not self._sodx_meets_minimum(signals):
+            print(f"{prefix}Passive join: SODX insufficient ({signals or 'none'})")
+            return False
+
+        self._active_output_signals = [int(x) for x in signals]
+        print(f"{prefix}Passive join: keeping existing SODX {self._active_output_signals}")
+
+        try:
+            self._flush_stream_buffer()
+            data, drained = self._drain_stream_to_latest(batch_size=64, max_batches=8)
+            if data is not None:
+                self._stream_started = True
+                print(f"{prefix}Passive join: sample OK (drained={drained})")
+                return True
+        except Exception as exc:
+            if self._is_data_format_missing_error(exc):
+                print(f"{prefix}Passive join: format packet missing — need full setup")
+            else:
+                print(f"{prefix}Passive join read failed: {exc}")
+
+        try:
+            self.connection.start_data_stream()
+            self._stream_started = True
+            time.sleep(0.15)
+            if self._probe_live_sample(timeout_s=2.0):
+                print(f"{prefix}Passive join: STA without STO OK")
+                return True
+        except Exception as exc:
+            print(f"{prefix}Passive join STA failed: {exc}")
+
+        self._stream_started = False
+        return False
+
+    def _try_soft_stream_recovery(self) -> bool:
+        """Recover a dead stream without STO or TCP reopen (coexist-friendly)."""
+        if not self.connection:
+            return False
+        try:
+            self._flush_stream_buffer()
+            if self._probe_live_sample(timeout_s=2.0):
+                return True
+        except Exception as exc:
+            print(f"[RECOVER] Soft flush/read failed: {exc}")
+
+        try:
+            self.connection.start_data_stream()
+            self._stream_started = True
+            time.sleep(0.1)
+            if self._probe_live_sample(timeout_s=2.0):
+                return True
+        except Exception as exc:
+            print(f"[RECOVER] Soft STA failed: {exc}")
+            self._stream_started = False
+        return False
+
     def _flush_stream_buffer(self):
         """Discard stale samples after the output signal layout changes."""
         if not self.connection:
@@ -200,16 +385,20 @@ class CHRocodileController:
         except Exception as ex:
             print(f"[STREAM] flush_connection_buffer: {ex}")
 
-    def _resync_data_stream(self):
+    def _resync_data_stream(self, stop_first: bool = True):
         """Restart streaming and flush stale samples after SODX changes."""
         if not self.connection:
             return
-        try:
-            self.connection.stop_data_stream()
-        except Exception:
-            pass
-        self._stream_started = False
-        time.sleep(0.05)
+        if stop_first and not self.coexist_with_chr_software:
+            try:
+                self.connection.stop_data_stream()
+            except Exception:
+                pass
+            self._stream_started = False
+            time.sleep(0.05)
+        elif stop_first and self.coexist_with_chr_software:
+            print("[STREAM] Coexist mode — resync without STO")
+            self._stream_started = False
         self._flush_stream_buffer()
         try:
             self.connection.start_data_stream()
@@ -218,10 +407,20 @@ class CHRocodileController:
             print(f"[STREAM] start_data_stream after resync FAILED: {ex}")
             self._stream_started = False
             return
+
+        # Format packet can arrive slightly after STA — brief settle before drain.
+        time.sleep(0.1)
+
         # Drop every queued packet so the next read is fresh (not pre-SODX layout).
-        _, drained = self._drain_stream_to_latest()
-        if drained:
-            print(f"[STREAM] Drained {drained} stale sample(s) after resync")
+        try:
+            _, drained = self._drain_stream_to_latest()
+            if drained:
+                print(f"[STREAM] Drained {drained} stale sample(s) after resync")
+        except Exception as ex:
+            if self._is_data_format_missing_error(ex) or self._is_stream_dead_error(ex):
+                print(f"[STREAM] Drain after resync hit stream error — will require probe/reopen: {ex}")
+            else:
+                print(f"[STREAM] Drain after resync failed: {ex}")
         self._last_sample_counter = None
 
     def _signal_is_active(self, signal_id: int) -> bool:
@@ -359,6 +558,141 @@ class CHRocodileController:
 
         return snapshot
         
+    def _is_data_format_missing_error(self, exc: Exception) -> bool:
+        """True for chrpy ERR_DATAFMT_MISSING (-536450304)."""
+        text = str(exc)
+        return ('-536450304' in text) or ('data format packet is missing' in text.lower())
+
+    def _is_stream_dead_error(self, exc_or_text) -> bool:
+        """True for errors that mean the chrpy sample stream must be fully reopened."""
+        text = str(exc_or_text)
+        return any(
+            code in text
+            for code in (
+                '-536451072',  # internal thread / stream dead
+                '-536450304',  # data format missing
+                '-536863232',  # unknown error often seen after dead stream
+                '-536580864',  # stream out of sync
+                '-536580859',
+                '-536580860',
+            )
+        )
+
+    def _probe_live_sample(self, timeout_s: float = 2.0) -> bool:
+        """
+        Confirm the sample stream is actually alive by reading one fresh sample.
+        get_output_signal_infos() alone is not enough — stream can look configured
+        but still be dead for GetNextSamples.
+        """
+        if not self.connection or not self._stream_started:
+            return False
+        try:
+            data, drained = self._read_fresh_sample(timeout_s)
+            ok = data is not None and getattr(data, 'sample_cnt', 0) > 0
+            if ok:
+                counter = self._read_sample_counter(data)
+                print(
+                    f"[CONNECT] Live sample OK "
+                    f"(counter={counter}, drained={drained})"
+                )
+            else:
+                print(f"[CONNECT] Live sample probe got no data within {timeout_s:.1f}s")
+            return ok
+        except Exception as exc:
+            print(f"[CONNECT] Live sample probe failed: {exc}")
+            return False
+
+    def _safe_close_connection(self, stop_stream: Optional[bool] = None):
+        """Best-effort close so a failed connect does not leave a stuck session."""
+        if stop_stream is None:
+            stop_stream = not self.coexist_with_chr_software
+
+        conn = self.connection
+        self.connection = None
+        self._stream_started = False
+        self._active_output_signals = []
+        self._last_sample_counter = None
+        if conn is None:
+            return
+        try:
+            if stop_stream:
+                try:
+                    conn.stop_data_stream()
+                except Exception:
+                    pass
+            try:
+                conn.flush_connection_buffer()
+            except Exception:
+                pass
+            handle = getattr(conn, 'conn_handle', None)
+            if handle:
+                try:
+                    conn.close()
+                except Exception as ex:
+                    # Invalid handle after a failed OpenConnection is common.
+                    print(f"[CONNECT] Close ignored: {ex}")
+        except Exception as ex:
+            print(f"[CONNECT] Close after failure: {ex}")
+
+    def _open_and_configure(
+        self,
+        ip_address: str,
+        attempt_label: str = "",
+        force_full_setup: bool = False,
+    ) -> None:
+        """Open TCP connection, configure SODX, start stream (raises on failure)."""
+        self.connection = connection_from_params(
+            addr=ip_address,
+            device_type=DeviceType.CHR_2,
+            conn_mode=OperationMode.SYNC
+        )
+        self.connection.open()
+
+        prefix = f"[CONNECT]{attempt_label} "
+
+        if (
+            not force_full_setup
+            and self.coexist_with_chr_software
+            and self._try_join_existing_stream(prefix)
+            and self._probe_live_sample(timeout_s=2.5)
+        ):
+            print(f"{prefix}Connected via passive join (CHR software coexistence)")
+            print(f"{prefix}Active SODX signals: {self._active_output_signals}")
+            return
+
+        if self.coexist_with_chr_software:
+            print(
+                f"{prefix}Passive join unavailable — full stream setup "
+                f"(may interrupt CHR native software)"
+            )
+        else:
+            print(f"{prefix}Stopping any existing stream ...")
+            try:
+                self.connection.stop_data_stream()
+                print(f"{prefix}Stream stopped OK")
+            except Exception as ex:
+                print(f"{prefix}Stream stop (ignored): {ex}")
+            time.sleep(0.15)
+
+        print(f"{prefix}Running _setup_measurement ...")
+        self._setup_measurement()
+        print(f"{prefix}_setup_measurement done")
+
+        print(f"{prefix}Starting data stream ...")
+        self._resync_data_stream(stop_first=not self.coexist_with_chr_software)
+        if not self._stream_started:
+            raise Exception("Data stream failed to start")
+
+        # Only declare success when a real sample can be read.
+        if not self._probe_live_sample(timeout_s=2.5):
+            raise Exception(
+                "Connected but sample stream is not delivering data "
+                "(device busy, leftover session, or stream dead)"
+            )
+
+        print(f"{prefix}Data stream started OK")
+        print(f"{prefix}Active SODX signals: {self._active_output_signals}")
+
     def connect(self, ip_address: str) -> Tuple[bool, str]:
         """
         Connect to the CHRocodile device.
@@ -378,46 +712,32 @@ class CHRocodileController:
         self.state = ConnectionState.CONNECTING
         self.ip_address = ip_address
         self.error_message = None
-        
-        try:
-            # Create connection (synchronous mode for simplicity)
-            self.connection = connection_from_params(
-                addr=ip_address,
-                device_type=DeviceType.CHR_2,
-                conn_mode=OperationMode.SYNC
-            )
-            
-            # Open the connection
-            self.connection.open()
 
-            print("[CONNECT] Stopping any existing stream ...")
+        last_error = None
+        for attempt in range(1, 4):
             try:
-                self.connection.stop_data_stream()
-                print("[CONNECT] Stream stopped OK")
-            except Exception as ex:
-                print(f"[CONNECT] Stream stop (pre-connect): {ex} (ignored)")
-            time.sleep(0.1)
+                self._open_and_configure(ip_address, attempt_label=f" Attempt {attempt}:")
+                self.state = ConnectionState.CONNECTED
+                return True, "Connected successfully"
 
-            print("[CONNECT] Running _setup_measurement ...")
-            self._setup_measurement()
-            print("[CONNECT] _setup_measurement done")
+            except Exception as e:
+                last_error = e
+                print(f"[CONNECT] Attempt {attempt} failed: {e}")
+                self._safe_close_connection()
+                if attempt < 3:
+                    time.sleep(0.5 * attempt)
+                    continue
+                break
 
-            print("[CONNECT] Starting data stream ...")
-            self._resync_data_stream()
-            if self._stream_started:
-                print("[CONNECT] Data stream started OK")
-                print(f"[CONNECT] Active SODX signals: {self._active_output_signals}")
-            else:
-                print("[CONNECT] Data stream start FAILED")
-
-            self.state = ConnectionState.CONNECTED
-            return True, "Connected successfully"
-            
-        except Exception as e:
-            self.state = ConnectionState.ERROR
-            self.error_message = str(e)
-            self.connection = None
-            return False, f"Connection failed: {str(e)}"
+        self.state = ConnectionState.ERROR
+        self.error_message = str(last_error)
+        hint = ""
+        if last_error and self._is_stream_dead_error(last_error):
+            hint = (
+                " Close any other CHRocodileGUI.exe / Python GUI still connected "
+                "to the device, then try again."
+            )
+        return False, f"Connection failed: {last_error}.{hint}"
     
     def disconnect(self) -> Tuple[bool, str]:
         """
@@ -434,10 +754,11 @@ class CHRocodileController:
         
         try:
             if self.connection:
-                try:
-                    self.connection.stop_data_stream()
-                except:
-                    pass
+                if not self.coexist_with_chr_software:
+                    try:
+                        self.connection.stop_data_stream()
+                    except Exception:
+                        pass
                 self._stream_started = False
 
                 # Close connection
@@ -482,30 +803,18 @@ class CHRocodileController:
             if before:
                 print(f"[SETUP] Device SODX before connect setup: {before}")
 
+            existing = self._pick_matching_sodx_candidate(before)
+            if existing is not None:
+                self._active_output_signals = before or existing
+                print(
+                    f"[SETUP] SODX already sufficient — skipping reconfigure: "
+                    f"{self._active_output_signals}"
+                )
+                return
+
             # Globals first, then peak signals — matches chrpy DOUBLE buffer layout.
             # 256=Thickness1, 257=Quality1, 260=Median1 (interferometric float).
-            sodx_candidates = [
-                [
-                    self.SIGNAL_SAMPLE_COUNTER,
-                    self.SIGNAL_INTENSITY,
-                    self.SIGNAL_THICKNESS,
-                    self.SIGNAL_QUALITY,
-                    self.SIGNAL_MEDIAN1,
-                ],
-                [
-                    self.SIGNAL_SAMPLE_COUNTER,
-                    self.SIGNAL_THICKNESS,
-                    self.SIGNAL_QUALITY,
-                    self.SIGNAL_MEDIAN1,
-                ],
-                [
-                    self.SIGNAL_THICKNESS,
-                    self.SIGNAL_QUALITY,
-                    self.SIGNAL_MEDIAN1,
-                ],
-                [self.SIGNAL_THICKNESS, self.SIGNAL_QUALITY],
-                [self.SIGNAL_THICKNESS],
-            ]
+            sodx_candidates = self._preferred_sodx_candidates()
 
             sodx_signals = None
             last_error = None
@@ -635,119 +944,172 @@ class CHRocodileController:
         if not self._measurement_lock.acquire(blocking=False):
             return {'error': 'Measurement already in progress'}
 
+        rate_hz = max(1, int(self.measuring_rate_hz))
+        avg_factor = max(1, int(self.data_average))
+        # Floor at 2.0s: 0.5s was too tight and caused false "No data" timeouts
+        # when the FIFO was briefly empty after a large drain.
+        timeout_s = min(5.0, max(2.0, (avg_factor / rate_hz) * 8.0))
+
         try:
-            # Ensure stream is running (pre-started in connect(); only fall back to
-            # starting it here if that failed or it has since been stopped).
-            if not self._stream_started:
-                self.start_data_stream()
-                self._stream_started = True
-
-            # With higher averaging (AVD/AVS), the first valid sample can take longer.
-            # Retry for a bounded time instead of failing immediately.
-            rate_hz = max(1, int(self.measuring_rate_hz))
-            avg_factor = max(1, int(self.data_average))
-            # Estimated sample period scales with averaging; add safety margin.
-            estimated_period_s = avg_factor / rate_hz
-            timeout_s = min(5.0, max(0.5, estimated_period_s * 8.0))
-
-            data = None
-            drained_total = 0
-            start_wait = time.time()
-            while (time.time() - start_wait) < timeout_s:
-                data, drained = self._drain_stream_to_latest()
-                drained_total += drained
-                if data is not None and data.sample_cnt > 0:
-                    break
-                time.sleep(0.01)
-
-            if data is None or data.sample_cnt == 0:
-                return {'error': f'No data received (timeout {timeout_s:.2f}s)'}
-            
-            if data.error_code < 0:
-                return {'error': f'Device error: {data.error_code}'}
-
-            sample_counter = self._read_sample_counter(data)
-            counter_stale = (
-                sample_counter is not None
-                and self._last_sample_counter is not None
-                and sample_counter <= self._last_sample_counter
+            return self._read_measurement_once(
+                include_spectrum=include_spectrum,
+                timeout_s=timeout_s,
             )
-            if drained_total > 20:
-                self._maybe_log_buffer_backlog(drained_total, sample_counter)
-            if counter_stale:
-                print(
-                    f"[BUFFER] Sample counter did not advance "
-                    f"({self._last_sample_counter} -> {sample_counter}); flushing"
-                )
-                self._flush_stream_buffer()
-                retry, retry_drained = self._drain_stream_to_latest()
-                drained_total += retry_drained
-                if retry is not None:
-                    data = retry
-                    sample_counter = self._read_sample_counter(data)
-            if sample_counter is not None:
-                self._last_sample_counter = sample_counter
-            
-            # Float signals are already in µm / quality units via chrpy DOUBLE buffer.
-            thickness = self._extract_first_signal(data, self.SIGNAL_THICKNESS)
-            quality = self._extract_first_signal(data, self.SIGNAL_QUALITY)
-            median1 = self._extract_first_signal(data, self.SIGNAL_MEDIAN1)
-            intensity = self._extract_first_signal(data, self.SIGNAL_INTENSITY)
-
-            _quality_sig = self.SIGNAL_QUALITY if quality is not None else None
-            intensity_sig = self.SIGNAL_INTENSITY if intensity is not None else None
-            
-            # For interferometric mode, peak signals are not the same as confocal mode
-            # We can try to get peak positions from spectrum if needed, but for now
-            # we'll just return None for peaks (they're not directly available as signals)
-            # Peak positions would need to be extracted from the spectrum data
-            peak1 = None
-            peak2 = None
-            
-            result = {
-                'thickness': thickness,
-                'median1': median1,
-                'intensity': intensity,
-                'quality': quality,
-                'peak1': peak1,
-                'peak2': peak2,
-                'intensity_signal_id': intensity_sig,
-                'quality_signal_id': _quality_sig,
-                'sample_counter': sample_counter,
-                'buffer_drained': drained_total,
-                'signal_snapshot': self._collect_signal_snapshot(data),
-                'timestamp': time.time()
-            }
-            
-            # Download spectrum if requested
-            if include_spectrum:
-                spectrum_data = self.download_spectrum()
-                if spectrum_data and 'error' not in spectrum_data:
-                    result['spectrum'] = spectrum_data.get('spectrum')
-                    # Peak positions can be extracted from spectrum in the GUI
-                    # using the _detect_peaks method
-            
-            return result
 
         except Exception as e:
             err_str = str(e)
-            # -536451072: chrpy internal thread error — stream is dead, needs restart.
-            if '-536451072' in err_str:
-                self._recover_data_stream()
+            # Dead/corrupt sample stream — recover and retry once.
+            if self._is_stream_dead_error(err_str):
+                recovered = self._recover_data_stream()
+                if recovered:
+                    try:
+                        return self._read_measurement_once(
+                            include_spectrum=include_spectrum,
+                            timeout_s=timeout_s,
+                        )
+                    except Exception as retry_exc:
+                        return {'error': f'Measurement error after recover: {retry_exc}'}
             return {'error': f'Measurement error: {err_str}'}
 
         finally:
             self._measurement_lock.release()
 
-    def _recover_data_stream(self):
-        """Stop and restart the data stream after an internal thread error."""
-        print("[RECOVER] Internal stream error — resyncing stream ...")
-        time.sleep(2.0)
-        self._resync_data_stream()
-        if self._stream_started:
-            print("[RECOVER] Stream restarted OK")
-        else:
-            print("[RECOVER] Stream restart FAILED")
+    def _read_measurement_once(self, include_spectrum: bool, timeout_s: float) -> dict:
+        """Read one measurement assuming the measurement lock is already held."""
+        if not self._stream_started:
+            self.start_data_stream()
+            self._stream_started = True
+
+        data, drained_total = self._read_fresh_sample(timeout_s)
+
+        if data is None or data.sample_cnt == 0:
+            # One gentle retry: short settle, drain again (no flush).
+            print(f"[MEAS] No sample within {timeout_s:.1f}s — retrying once ...")
+            time.sleep(0.05)
+            data, drained_retry = self._read_fresh_sample(timeout_s)
+            drained_total += drained_retry
+            if data is None or data.sample_cnt == 0:
+                return {'error': f'No data received (timeout {timeout_s:.2f}s)'}
+
+        if data.error_code < 0:
+            return {'error': f'Device error: {data.error_code}'}
+
+        sample_counter = self._read_sample_counter(data)
+        counter_stale = self._sample_counter_stale(
+            self._last_sample_counter, sample_counter
+        )
+        if drained_total > 20:
+            self._maybe_log_buffer_backlog(drained_total, sample_counter)
+        if counter_stale:
+            print(
+                f"[BUFFER] Sample counter did not advance "
+                f"({self._last_sample_counter} -> {sample_counter}); "
+                f"draining again without flush"
+            )
+            # Do NOT force_flush here — that was killing the stream.
+            data2, retry_drained = self._read_fresh_sample(timeout_s, force_flush=False)
+            drained_total += retry_drained
+            if data2 is not None and data2.sample_cnt > 0:
+                data = data2
+                sample_counter = self._read_sample_counter(data)
+        if sample_counter is not None:
+            self._last_sample_counter = sample_counter
+
+        thickness = self._extract_first_signal(data, self.SIGNAL_THICKNESS)
+        quality = self._extract_first_signal(data, self.SIGNAL_QUALITY)
+        median1 = self._extract_first_signal(data, self.SIGNAL_MEDIAN1)
+        intensity = self._extract_first_signal(data, self.SIGNAL_INTENSITY)
+
+        print(
+            f"[MEAS] counter={sample_counter} drained={drained_total} "
+            f"thickness={thickness} median1={median1} "
+            f"quality={quality} intensity={intensity}"
+        )
+
+        result = {
+            'thickness': thickness,
+            'median1': median1,
+            'intensity': intensity,
+            'quality': quality,
+            'peak1': None,
+            'peak2': None,
+            'intensity_signal_id': self.SIGNAL_INTENSITY if intensity is not None else None,
+            'quality_signal_id': self.SIGNAL_QUALITY if quality is not None else None,
+            'sample_counter': sample_counter,
+            'buffer_drained': drained_total,
+            'signal_snapshot': self._collect_signal_snapshot(data),
+            'timestamp': time.time()
+        }
+
+        if include_spectrum:
+            spectrum_data = self.download_spectrum()
+            if spectrum_data and 'error' not in spectrum_data:
+                result['spectrum'] = spectrum_data.get('spectrum')
+
+        return result
+
+    def _recover_data_stream(self) -> bool:
+        """
+        Recover after chrpy stream death.
+
+        In coexist mode, only soft recovery is attempted so CHR native software
+        is not kicked off the device. Full TCP reopen is used otherwise.
+        """
+        now = time.time()
+        if (now - self._last_recover_ts) < self._recover_min_interval_s:
+            print(
+                f"[RECOVER] Skipping recovery "
+                f"(last attempt {now - self._last_recover_ts:.1f}s ago)"
+            )
+            return False
+        self._last_recover_ts = now
+
+        if self.coexist_with_chr_software:
+            print("[RECOVER] Coexist mode — trying soft recovery (no STO/reopen)")
+            if self._try_soft_stream_recovery():
+                print("[RECOVER] Soft recovery OK")
+                return True
+            print(
+                "[RECOVER] Soft recovery failed. CHR native software may hold "
+                "the device — disconnect the other client or use Reconnect here."
+            )
+            self.state = ConnectionState.ERROR
+            self.error_message = (
+                "Stream lost while sharing with CHR native software. "
+                "Close the other client or disconnect/reconnect from this app."
+            )
+            return False
+
+        ip = self.ip_address
+        if not ip:
+            print("[RECOVER] No IP address available for reopen")
+            self._stream_started = False
+            return False
+
+        print("[RECOVER] Internal stream error — full connection reopen ...")
+        self._safe_close_connection(stop_stream=True)
+        last_exc = None
+        for attempt in range(1, 4):
+            time.sleep(1.0 * attempt)
+            try:
+                self.state = ConnectionState.CONNECTING
+                self._open_and_configure(
+                    ip,
+                    attempt_label=f" RECOVER {attempt}:",
+                    force_full_setup=True,
+                )
+                self.state = ConnectionState.CONNECTED
+                print("[RECOVER] Full reopen OK")
+                return True
+            except Exception as exc:
+                last_exc = exc
+                print(f"[RECOVER] Full reopen attempt {attempt} FAILED: {exc}")
+                self._safe_close_connection(stop_stream=True)
+
+        print(f"[RECOVER] Full reopen FAILED: {last_exc}")
+        self.state = ConnectionState.ERROR
+        self.error_message = str(last_exc)
+        return False
 
     def start_continuous_measurement(self, interval_ms: int = 100, include_spectrum: bool = False):
         """
@@ -793,8 +1155,9 @@ class CHRocodileController:
         if self.measurement_thread:
             self.measurement_thread.join(timeout=2.0)
             self.measurement_thread = None
-        
-        self.stop_data_stream()
+
+        if not self.coexist_with_chr_software:
+            self.stop_data_stream()
     
     def _continuous_measurement_loop(self):
         """Internal loop for continuous measurements."""

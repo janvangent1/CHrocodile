@@ -30,6 +30,14 @@ def build_exe():
     
     # Get the script directory
     script_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Rebuild multi-size Windows icon before packaging
+    make_icon_script = os.path.join(script_dir, 'assets', 'make_icon.py')
+    if os.path.exists(make_icon_script):
+        print("Rebuilding application icon ...")
+        import subprocess
+        subprocess.run([sys.executable, make_icon_script], check=True)
+        print()
     
     # Main script
     main_script = os.path.join(script_dir, 'chrocodile_gui.py')
@@ -70,8 +78,7 @@ def build_exe():
         '--exclude-module', 'test',
         '--exclude-module', 'tests',
         
-        # Icon (optional - create one if you have it)
-        # '--icon=icon.ico',
+        '--icon', os.path.join(script_dir, 'assets', 'chrocodile.ico'),
         
         # Version info (optional)
         # '--version-file=version_info.txt',

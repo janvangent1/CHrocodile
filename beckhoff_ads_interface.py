@@ -129,11 +129,15 @@ class BeckhoffADSInterface:
         self._last_start_cont_state = False
         self._last_stop_cont_state = False
         self._measurement_in_progress = False
+        self._measurement_started_at = 0.0
+        self._measurement_timeout_s = 10.0
 
         # Polling stats (for monitor display)
         self._poll_interval = 0.0
         self._poll_count = 0
         self._last_poll_time: Optional[float] = None
+        self._last_written_values: Dict[str, Any] = {}
+        self._last_write_time: Optional[float] = None
 
         # TwinCAT STRING(n) size — must match the PLC symbol declaration.
         # Default STRING in TwinCAT is STRING(80) = 81 bytes (80 chars + null).
@@ -144,16 +148,22 @@ class BeckhoffADSInterface:
     # -----------------------------------------------------
 
     def _log(self, event_type: str, message: str, data: Dict[str, Any] = None):
-        """Log message via callback or print."""
+        """Log to ADS monitor (if open) and always print key events to the terminal."""
+        data = data or {}
+
+        # Always echo trigger / write / handshake / error to the console for troubleshooting.
+        if event_type in ("trigger", "write", "handshake", "error", "connection"):
+            print(f"[ADS {event_type.upper()}] {message}")
+
         if self.log_callback:
             try:
-                self.log_callback(event_type, message, data or {})
+                self.log_callback(event_type, message, data)
             except Exception:
                 # Log callback might be invalid (window destroyed, etc.)
-                # Clear it to prevent future errors
                 self.log_callback = None
-                print(f"[ADS {event_type.upper()}] {message}")
-        else:
+                if event_type not in ("trigger", "write", "handshake", "error", "connection"):
+                    print(f"[ADS {event_type.upper()}] {message}")
+        elif event_type not in ("trigger", "write", "handshake", "error", "connection"):
             print(f"[ADS {event_type.upper()}] {message}")
 
     # -----------------------------------------------------
@@ -346,6 +356,13 @@ class BeckhoffADSInterface:
             "last_poll_time": self._last_poll_time,
         }
 
+    def get_last_written_values(self) -> Dict[str, Any]:
+        """Return the most recent values written to the PLC (for ADS monitor)."""
+        return {
+            "values": dict(self._last_written_values),
+            "timestamp": self._last_write_time,
+        }
+
     def get_disabled_variables(self):
         """Get disabled variables (for compatibility with monitor)."""
         return set()  # Simplified version doesn't disable variables
@@ -375,6 +392,29 @@ class BeckhoffADSInterface:
 
                 # Read trigger
                 trigger = self._read(self.var_trigger, pyads.PLCTYPE_BOOL)
+
+                # Watchdog: never leave handshake stuck if a result write was missed
+                if (
+                    self._measurement_in_progress
+                    and self._measurement_started_at
+                    and (time.time() - self._measurement_started_at) > self._measurement_timeout_s
+                ):
+                    self._log(
+                        "error",
+                        f"Measurement handshake timed out after {self._measurement_timeout_s:.0f}s — resetting"
+                    )
+                    try:
+                        self._write(self.var_busy, False, pyads.PLCTYPE_BOOL)
+                        self._write(self.var_ready, True, pyads.PLCTYPE_BOOL)
+                        self._write_string(self.var_error, "Measurement timeout")
+                    except Exception:
+                        pass
+                    self._measurement_in_progress = False
+                    self._measurement_started_at = 0.0
+                    try:
+                        self._last_trigger_state = trigger
+                    except Exception:
+                        self._last_trigger_state = False
 
                 # Rising edge detection
                 if trigger and not self._last_trigger_state and not self._measurement_in_progress:
@@ -427,7 +467,15 @@ class BeckhoffADSInterface:
     def _handle_trigger(self):
         """Handle measurement trigger."""
         self._measurement_in_progress = True
-        self._log("trigger", "Measurement triggered")
+        self._measurement_started_at = time.time()
+        # Consume the rising edge immediately so a held-high trigger cannot re-fire
+        # while we wait for the measurement worker / handshake.
+        self._last_trigger_state = True
+        self._log(
+            "trigger",
+            "Measurement triggered (busy=True, ready=False)",
+            {"busy": True, "ready": False},
+        )
 
         try:
             self._write(self.var_busy, True, pyads.PLCTYPE_BOOL)
@@ -441,11 +489,13 @@ class BeckhoffADSInterface:
             self._write_string(self.var_error, str(e))
             self._write(self.var_busy, False, pyads.PLCTYPE_BOOL)
             self._measurement_in_progress = False
+            self._measurement_started_at = 0.0
 
     def write_measurement_result(self, measurement_data: Dict[str, Any]):
         """Write measurement results to PLC."""
         if not self.plc or not self.plc.is_open:
             self._measurement_in_progress = False
+            self._measurement_started_at = 0.0
             return
 
         try:
@@ -453,7 +503,7 @@ class BeckhoffADSInterface:
             try:
                 current_trigger = self._read(self.var_trigger, pyads.PLCTYPE_BOOL)
                 self._last_trigger_state = current_trigger
-            except:
+            except Exception:
                 pass
 
             # Write results
@@ -482,13 +532,40 @@ class BeckhoffADSInterface:
             else:
                 self._write_string(self.var_error, '')
 
+            written = {
+                "thickness": None if thickness is None else float(thickness),
+                "peak1": None if peak1 is None else float(peak1),
+                "peak2": None if peak2 is None else float(peak2),
+                "count": int(count),
+                "busy": False,
+                "ready": True,
+                "error": str(error_text) if error_text else "",
+                "median1": measurement_data.get("median1"),
+                "quality": measurement_data.get("quality"),
+                "intensity": measurement_data.get("intensity"),
+            }
+            self._last_written_values = written
+            self._last_write_time = time.time()
+
             self._measurement_in_progress = False
-            self._log("handshake", "Measurement complete")
+            self._measurement_started_at = 0.0
+
+            summary = (
+                f"thickness(median)={written['thickness']}, "
+                f"peak1(quality)={written['peak1']}, "
+                f"peak2(intensity)={written['peak2']}, "
+                f"count={written['count']}, busy=False, ready=True"
+            )
+            if written["error"]:
+                summary += f", error={written['error']}"
+            self._log("write", f"ADS write -> PLC: {summary}", written)
+            self._log("handshake", "Measurement complete (handshake done)", written)
 
         except Exception as e:
             self._log("error", f"Write result error: {e}")
             self._write(self.var_busy, False, pyads.PLCTYPE_BOOL)
             self._measurement_in_progress = False
+            self._measurement_started_at = 0.0
 
     def reset_handshake_state(self):
         """
@@ -502,6 +579,7 @@ class BeckhoffADSInterface:
 
         try:
             self._measurement_in_progress = False
+            self._measurement_started_at = 0.0
             self._write(self.var_busy, False, pyads.PLCTYPE_BOOL)
             self._write(self.var_ready, False, pyads.PLCTYPE_BOOL)
             self._write_string(self.var_error, '')

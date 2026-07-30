@@ -35,6 +35,26 @@ except Exception as e:
     print(f"Warning: Could not import Beckhoff ADS interface: {e}")
 
 
+def _resource_path(relative_path: str) -> str:
+    """Resolve bundled resource paths for script and PyInstaller builds."""
+    if getattr(sys, 'frozen', False):
+        base_dir = sys._MEIPASS
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, relative_path)
+
+
+def _apply_window_icon(window: tk.Misc) -> None:
+    """Set the crocodile icon on a Tk window (title bar and taskbar on Windows)."""
+    icon_path = _resource_path(os.path.join('assets', 'chrocodile.ico'))
+    if not os.path.exists(icon_path):
+        return
+    try:
+        window.iconbitmap(default=icon_path)
+    except tk.TclError:
+        pass
+
+
 class CHRocodileGUI:
     """
     Main GUI application for CHRocodile thickness measurement.
@@ -50,6 +70,7 @@ class CHRocodileGUI:
         self.root = root
         self.root.title("CHRocodile Film Thickness Measurement")
         self.root.geometry("1750x900")
+        _apply_window_icon(self.root)
         
         # Device controller and simulator
         self.controller = CHRocodileController(data_callback=self.on_measurement_data)
@@ -90,6 +111,7 @@ class CHRocodileGUI:
         self._create_widgets()
         
         # Display log file location in status (after GUI is ready)
+        self._log_status(f"Settings file: {self.settings_manager.settings_file}")
         self._log_status(f"Logging to: {self.log_file_path}")
         
         # Start queue processing
@@ -118,7 +140,7 @@ class CHRocodileGUI:
         
         ttk.Label(conn_frame, text="IP Address:").grid(row=0, column=0, padx=(0, 5))
         self.ip_entry = ttk.Entry(conn_frame, width=15)
-        self.ip_entry.insert(0, "132.31.40.110")
+        self.ip_entry.insert(0, self.settings_manager.get('device.default_ip', '132.31.40.110'))
         self.ip_entry.grid(row=0, column=1, padx=(0, 5))
         
         self.config_ip_btn = ttk.Button(conn_frame, text="Configure Device IP", 
@@ -304,12 +326,17 @@ class CHRocodileGUI:
         self.plc_thickness_source_combo = ttk.Combobox(
             settings_row2,
             textvariable=self.plc_thickness_source_var,
-            values=["Thickness", "Median 1"],
+            values=["Median 1", "Thickness"],
             state="readonly",
             width=12
         )
         self.plc_thickness_source_combo.grid(row=0, column=8, padx=(0, 5))
         self.plc_thickness_source_combo.bind("<<ComboboxSelected>>", self.on_plc_thickness_source_change)
+        ttk.Label(
+            settings_row2,
+            text="(ADS: peak1=quality, peak2=intensity)",
+            foreground="gray",
+        ).grid(row=0, column=9, padx=(5, 0))
         
         # Middle section: Display and plots
         middle_frame = ttk.Frame(main_frame)
@@ -482,9 +509,9 @@ class CHRocodileGUI:
 
     def _load_plc_thickness_source_setting(self) -> str:
         """Load persisted PLC thickness source setting."""
-        source = self.settings_manager.get('device.plc_thickness_source', 'Thickness')
+        source = self.settings_manager.get('device.plc_thickness_source', 'Median 1')
         if source not in ("Thickness", "Median 1"):
-            source = "Thickness"
+            source = "Median 1"
         return source
     
     def _log_status(self, message: str):
@@ -516,7 +543,65 @@ class CHRocodileGUI:
         # Schedule next check
         self.root.after(100, self._process_queue)
     
-    def _handle_measurement_data(self, data: dict):
+    def _prepare_plc_payload(self, data: dict, measurement_count: Optional[int] = None) -> dict:
+        """
+        Build the ADS result payload for a measurement (success or error).
+
+        PLC mapping:
+          - thickness  <- Median 1 (or Thickness if that source is selected)
+          - peak1      <- Quality
+          - peak2      <- Intensity
+        """
+        if measurement_count is None:
+            measurement_count = self.measurement_count
+
+        if 'error' in data:
+            return {
+                "thickness": None,
+                "peak1": None,
+                "peak2": None,
+                "timestamp": time.time(),
+                "measurement_count": measurement_count,
+                "error": data.get('error', 'Unknown error'),
+            }
+
+        thickness = data.get('thickness')
+        median1 = data.get('median1')
+        quality = data.get('quality')
+        intensity = data.get('intensity')
+        below_quality_threshold = self._is_below_quality_threshold(quality)
+
+        try:
+            selected_source = self.plc_thickness_source_var.get()
+        except Exception:
+            selected_source = self.plc_thickness_source
+
+        # Default / preferred: send Median 1 on the thickness PLC variable.
+        raw_plc_value = median1 if selected_source == "Median 1" else thickness
+        plc_thickness = raw_plc_value
+        if plc_thickness is not None and below_quality_threshold:
+            plc_thickness = 0.0
+
+        return {
+            "thickness": plc_thickness,
+            "median1": median1,
+            # Reuse peak PLC slots for quality / intensity (TwinCAT symbols stay peak1/peak2).
+            "peak1": None if quality is None else float(quality),
+            "peak2": None if intensity is None else float(intensity),
+            "intensity": intensity,
+            "quality": quality,
+            "timestamp": data.get('timestamp'),
+            "measurement_count": measurement_count,
+        }
+
+    def _complete_plc_handshake(self, data: dict, measurement_count: Optional[int] = None) -> None:
+        """Write measurement result / error to PLC immediately (safe from worker threads)."""
+        if not (self.beckhoff_ads_interface and self.beckhoff_ads_interface.is_running()):
+            return
+        payload = self._prepare_plc_payload(data, measurement_count=measurement_count)
+        self.beckhoff_ads_interface.write_measurement_result(payload)
+
+    def _handle_measurement_data(self, data: dict, write_plc: bool = True):
         """Handle measurement data in main thread."""
         if 'error' in data:
             error_msg = data['error']
@@ -525,16 +610,8 @@ class CHRocodileGUI:
                 self.logger.error(f"Measurement error: {error_msg}")
 
             # Ensure PLC handshake is not left hanging on measurement errors.
-            if self.beckhoff_ads_interface and self.beckhoff_ads_interface.is_running():
-                plc_error_data = {
-                    "thickness": None,
-                    "peak1": None,
-                    "peak2": None,
-                    "timestamp": time.time(),
-                    "measurement_count": self.measurement_count,
-                    "error": error_msg,
-                }
-                self.beckhoff_ads_interface.write_measurement_result(plc_error_data)
+            if write_plc:
+                self._complete_plc_handshake(data)
             return
         
         thickness = data.get('thickness')
@@ -645,25 +722,11 @@ class CHRocodileGUI:
                 f"Intensity={intensity_text}, Quality={quality_text}"
             )
         
-        # Send measurement result to Beckhoff PLC via ADS if interface is active
-        # This ensures PLC-triggered measurements complete the handshake properly
-        if self.beckhoff_ads_interface and self.beckhoff_ads_interface.is_running():
-            selected_source = self.plc_thickness_source_var.get()
-            raw_plc_value = median1 if selected_source == "Median 1" else thickness
-            plc_thickness = raw_plc_value
-            if plc_thickness is not None and below_quality_threshold:
-                plc_thickness = 0.0
-            plc_data = {
-                "thickness": plc_thickness,
-                "median1": median1,
-                "peak1": peak1,
-                "peak2": peak2,
-                "intensity": intensity,
-                "quality": quality,
-                "timestamp": data.get('timestamp'),
-                "measurement_count": self.measurement_count
-            }
-            self.beckhoff_ads_interface.write_measurement_result(plc_data)
+        # Send measurement result to Beckhoff PLC via ADS if interface is active.
+        # PLC-triggered measurements may already have completed the handshake in a
+        # worker thread (write_plc=False) so they don't depend on the Tk event loop.
+        if write_plc:
+            self._complete_plc_handshake(data, measurement_count=self.measurement_count)
     
     def on_measurement_data(self, data: dict):
         """Callback for measurement data (called from device thread)."""
@@ -672,6 +735,14 @@ class CHRocodileGUI:
         # both device-triggered and PLC-triggered measurements complete handshake
         self.data_queue.put(data)
     
+    def _persist_device_ip_setting(self, ip_address: str) -> None:
+        """Save the last-used device IP so script and exe share the same default."""
+        ip_address = (ip_address or '').strip()
+        if not ip_address:
+            return
+        self.settings_manager.set('device.default_ip', ip_address)
+        self.settings_manager.save()
+
     def on_connect(self):
         """Handle connect button click."""
         ip_address = self.ip_entry.get().strip()
@@ -700,6 +771,7 @@ class CHRocodileGUI:
     def _on_connect_complete(self, success: bool, message: str):
         """Handle connection completion."""
         if success:
+            self._persist_device_ip_setting(self.ip_entry.get().strip())
             self.status_label.config(text="Connected", foreground="green")
             self.connect_btn.config(state=tk.DISABLED)
             self.disconnect_btn.config(state=tk.NORMAL)
@@ -844,6 +916,7 @@ class CHRocodileGUI:
                 # Update the IP entry field
                 self.ip_entry.delete(0, tk.END)
                 self.ip_entry.insert(0, new_ip)
+                self._persist_device_ip_setting(new_ip)
                 # Disconnect since IP changed
                 self.on_disconnect()
                 dialog.destroy()
@@ -888,37 +961,83 @@ class CHRocodileGUI:
                 self.spectrum_enabled_var.set(False)
                 self._close_spectrum_window()
     
+    def _run_plc_triggered_measurement(self):
+        """
+        Run a PLC-triggered measurement without waiting on the Tk event loop.
+
+        Previously the ADS thread only scheduled Tk `after()` callbacks, so if the
+        GUI was busy the handshake stayed in busy=True and further triggers hung
+        until a manual measurement cleared the state.
+        """
+        def worker():
+            try:
+                if self.simulation_mode:
+                    data = self.simulator.simulate_measurement()
+                    result = {
+                        'thickness': data.thickness,
+                        'median1': data.median1,
+                        'intensity': data.intensity,
+                        'quality': data.quality,
+                        'peak1': data.peak1,
+                        'peak2': data.peak2,
+                        'spectrum': None,
+                        'timestamp': data.timestamp,
+                    }
+                else:
+                    result = self.controller.get_single_measurement(include_spectrum=False)
+            except Exception as exc:
+                result = {'error': f'PLC trigger measurement failed: {exc}'}
+
+            # Complete ADS handshake immediately from this worker thread.
+            next_count = self.measurement_count + (0 if 'error' in result else 1)
+            self._complete_plc_handshake(result, measurement_count=next_count)
+
+            # Update GUI later; do not write PLC again.
+            try:
+                self.root.after(
+                    0,
+                    lambda r=result: self._handle_measurement_data(r, write_plc=False),
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name="PLCTriggerMeas").start()
+
     def on_single_measurement(self, include_spectrum: Optional[bool] = None):
         """Handle single measurement button click."""
         if include_spectrum is None:
             include_spectrum = bool(self.spectrum_enabled_var.get())
 
         def measure_thread():
-            if self.simulation_mode:
-                data = self.simulator.simulate_measurement()
-                result = {
-                    'thickness': data.thickness,
-                    'median1': data.median1,
-                    'intensity': data.intensity,
-                    'quality': data.quality,
-                    'peak1': data.peak1,
-                    'peak2': data.peak2,
-                    'spectrum': data.spectrum if include_spectrum else None,
-                    'signal_snapshot': {
-                        'signal_ids': ['sim_thickness', 'sim_median1', 'sim_intensity', 'sim_quality'],
-                        'signals': {
-                            'sim_thickness': data.thickness,
-                            'sim_median1': data.median1,
-                            'sim_intensity': data.intensity,
-                            'sim_quality': data.quality,
-                        }
-                    },
-                    'timestamp': data.timestamp
-                }
-            else:
-                result = self.controller.get_single_measurement(include_spectrum=include_spectrum)
-            
-            self.root.after(0, lambda: self._handle_measurement_data(result))
+            try:
+                if self.simulation_mode:
+                    data = self.simulator.simulate_measurement()
+                    result = {
+                        'thickness': data.thickness,
+                        'median1': data.median1,
+                        'intensity': data.intensity,
+                        'quality': data.quality,
+                        'peak1': data.peak1,
+                        'peak2': data.peak2,
+                        'spectrum': data.spectrum if include_spectrum else None,
+                        'signal_snapshot': {
+                            'signal_ids': ['sim_thickness', 'sim_median1', 'sim_intensity', 'sim_quality'],
+                            'signals': {
+                                'sim_thickness': data.thickness,
+                                'sim_median1': data.median1,
+                                'sim_intensity': data.intensity,
+                                'sim_quality': data.quality,
+                            }
+                        },
+                        'timestamp': data.timestamp
+                    }
+                else:
+                    result = self.controller.get_single_measurement(include_spectrum=include_spectrum)
+            except Exception as exc:
+                result = {'error': f'Measurement failed: {exc}'}
+
+            # Manual measurements also clear a stuck PLC handshake if ADS is waiting.
+            self.root.after(0, lambda r=result: self._handle_measurement_data(r, write_plc=True))
         
         threading.Thread(target=measure_thread, daemon=True).start()
     
@@ -1777,9 +1896,10 @@ class CHRocodileGUI:
             Dictionary with command result
         """
         if command == "trigger_measurement":
-            # Trigger a single measurement from PLC
-            # Use fast path for PLC trigger (no spectrum download).
-            self.root.after(0, lambda: self.on_single_measurement(include_spectrum=False))
+            # Run measurement + ADS handshake on a worker thread.
+            # Do NOT wait for Tk after() — that is what caused intermittent hangs
+            # until a manual measurement cleared busy/_measurement_in_progress.
+            self._run_plc_triggered_measurement()
             return {
                 "triggered": True,
                 "message": "Measurement triggered"
@@ -2192,6 +2312,18 @@ class BeckhoffADSMonitor:
             else:
                 status_text += " | Disconnected"
                 self.status_label.config(text=status_text, foreground="gray")
+
+        # Last values written to PLC via ADS
+        values_frame = ttk.LabelFrame(main_frame, text="Last Values Sent to PLC (ADS Write)", padding="10")
+        values_frame.pack(fill=tk.X, pady=(0, 10))
+        self.values_label = ttk.Label(
+            values_frame,
+            text="No ADS writes yet",
+            foreground="gray",
+            font=("Consolas", 9),
+            justify=tk.LEFT,
+        )
+        self.values_label.pack(anchor=tk.W)
         
         # Filter frame
         filter_frame = ttk.Frame(main_frame)
@@ -2317,8 +2449,17 @@ class BeckhoffADSMonitor:
             timestamp = entry["timestamp"]
             event_type = entry["type"].upper()
             message = entry["message"]
-            
-            line = f"[{timestamp}] [{event_type}] {message}\n"
+            data = entry.get("data") or {}
+
+            line = f"[{timestamp}] [{event_type}] {message}"
+            if data and entry["type"] in ("write", "handshake"):
+                detail_parts = []
+                for key in ("thickness", "peak1", "peak2", "count", "quality", "intensity", "busy", "ready", "error"):
+                    if key in data and data[key] not in (None, ""):
+                        detail_parts.append(f"{key}={data[key]}")
+                if detail_parts and "thickness=" not in message:
+                    line += " | " + ", ".join(detail_parts)
+            line += "\n"
             
             self.log_text.insert(tk.END, line, entry["type"])
         
@@ -2380,9 +2521,41 @@ class BeckhoffADSMonitor:
                     )
             else:
                 self.polling_label.config(text="Polling: inactive", foreground="gray")
+
+            # Last ADS write values
+            try:
+                last = self.ads_interface.get_last_written_values()
+                values = last.get("values") or {}
+                ts = last.get("timestamp")
+                if values:
+                    age = ""
+                    if ts is not None:
+                        ago = time.time() - ts
+                        age = f"  ({ago:.1f}s ago)" if ago < 60 else f"  ({int(ago)}s ago)"
+                    lines = [
+                        f"thickness={values.get('thickness')}    "
+                        f"peak1={values.get('peak1')}    "
+                        f"peak2={values.get('peak2')}    "
+                        f"count={values.get('count')}",
+                        f"busy={values.get('busy')}    ready={values.get('ready')}    "
+                        f"quality={values.get('quality')}    intensity={values.get('intensity')}",
+                    ]
+                    err = values.get("error") or ""
+                    if err:
+                        lines.append(f"error={err}")
+                    self.values_label.config(
+                        text="\n".join(lines) + age,
+                        foreground="black",
+                    )
+                else:
+                    self.values_label.config(text="No ADS writes yet", foreground="gray")
+            except Exception:
+                self.values_label.config(text="Unable to read last ADS values", foreground="orange")
         else:
             self.status_label.config(text="Not connected", foreground="gray")
             self.polling_label.config(text="Polling: —", foreground="gray")
+            if hasattr(self, "values_label"):
+                self.values_label.config(text="No ADS writes yet", foreground="gray")
     
     def _update_status_loop(self):
         """Periodically update status."""

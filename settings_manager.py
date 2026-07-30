@@ -8,7 +8,8 @@ Works with both script execution and PyInstaller frozen executables.
 import os
 import json
 import sys
-from typing import Dict, Any
+import shutil
+from typing import Dict, Any, List, Optional
 
 
 class SettingsManager:
@@ -39,7 +40,7 @@ class SettingsManager:
         "device": {
             "default_ip": "132.31.40.110",
             "quality_threshold": 0.0,
-            "plc_thickness_source": "Thickness"
+            "plc_thickness_source": "Median 1"
         }
     }
     
@@ -52,25 +53,70 @@ class SettingsManager:
         """
         if settings_file is None:
             settings_file = self._get_default_settings_path()
+            self._migrate_legacy_settings_if_needed(settings_file)
         
         self.settings_file = settings_file
         self.settings = self.DEFAULT_SETTINGS.copy()
         self.load()
     
+    @staticmethod
+    def _app_data_dir() -> str:
+        """Return per-user CHRocodile config directory (shared by script and exe)."""
+        app_data = os.environ.get('APPDATA') or os.path.expanduser('~')
+        config_dir = os.path.join(app_data, 'CHRocodile')
+        os.makedirs(config_dir, exist_ok=True)
+        return config_dir
+
     def _get_default_settings_path(self) -> str:
         """
         Get default path for settings file.
-        Works for both script execution and PyInstaller frozen executables.
+        Uses a shared per-user location so script and PyInstaller exe share settings.
         """
+        return os.path.join(self._app_data_dir(), 'chrocodile_settings.json')
+
+    def _legacy_settings_paths(self) -> List[str]:
+        """Legacy settings locations to migrate from (newest existing file wins)."""
+        candidates: List[str] = []
+
+        cwd_path = os.path.join(os.getcwd(), 'chrocodile_settings.json')
+        candidates.append(os.path.abspath(cwd_path))
+
         if getattr(sys, 'frozen', False):
-            # Running as compiled executable
-            # Store settings next to executable
-            base_path = os.path.dirname(sys.executable)
+            exe_dir = os.path.dirname(sys.executable)
+            candidates.append(os.path.join(exe_dir, 'chrocodile_settings.json'))
+            # Typical layout: project/chrocodile_settings.json with exe in project/dist/
+            candidates.append(os.path.join(os.path.dirname(exe_dir), 'chrocodile_settings.json'))
         else:
-            # Running as script
-            base_path = os.path.dirname(os.path.abspath(__file__))
-        
-        return os.path.join(base_path, 'chrocodile_settings.json')
+            project_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates.append(os.path.join(project_dir, 'chrocodile_settings.json'))
+
+        # De-duplicate while preserving order
+        seen = set()
+        unique: List[str] = []
+        for path in candidates:
+            norm = os.path.normcase(os.path.abspath(path))
+            if norm not in seen:
+                seen.add(norm)
+                unique.append(path)
+        return unique
+
+    def _migrate_legacy_settings_if_needed(self, target_path: str) -> None:
+        """Copy the newest legacy settings file into the shared user config path."""
+        if os.path.exists(target_path):
+            return
+
+        legacy_paths = [p for p in self._legacy_settings_paths() if os.path.exists(p)]
+        if not legacy_paths:
+            return
+
+        source_path = max(legacy_paths, key=os.path.getmtime)
+        try:
+            shutil.copy2(source_path, target_path)
+            print(
+                f"Migrated settings from {source_path} to {target_path}"
+            )
+        except Exception as exc:
+            print(f"Warning: Could not migrate settings from {source_path}: {exc}")
     
     def load(self) -> Dict[str, Any]:
         """
